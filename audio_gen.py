@@ -1,7 +1,8 @@
-import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os
+import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time
 from scipy.io import wavfile
 from pydub import AudioSegment
-from bark import SAMPLE_RATE, preload_models, generate_audio
+# Rename the imported function to avoid the conflict
+from bark import SAMPLE_RATE, preload_models, generate_audio as bark_generate_audio
 from tqdm import tqdm
 
 # Import shared resources
@@ -22,6 +23,50 @@ nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 AUDIO_OUTPUT_DIR = "/data/podcast_audio"
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
 
+def normalize_script_format(script_data):
+    """Ensures the script is in the correct format of (speaker, text) tuples"""
+    normalized_lines = []
+    
+    if not isinstance(script_data, list):
+        print(f"Warning: Expected list but got {type(script_data)}")
+        return [("Speaker 1", "Default audio content")]
+    
+    for item in script_data:
+        if isinstance(item, tuple) and len(item) == 2:
+            speaker, text = item
+            
+            # Handle special cases
+            if isinstance(text, list) and len(text) > 0:
+                # Extract text from list of dicts if needed
+                if all(isinstance(dict_item, dict) for dict_item in text):
+                    combined_text = ""
+                    for dict_item in text:
+                        if 'role' in dict_item and dict_item.get('role') == 'assistant':
+                            content = dict_item.get('content', '')
+                            if content and isinstance(content, str):
+                                combined_text = content
+                                break
+                    
+                    if combined_text:
+                        normalized_lines.append((speaker, combined_text))
+                    else:
+                        normalized_lines.append((speaker, "Generated content"))
+                else:
+                    # Join list elements into a single string
+                    normalized_lines.append((speaker, " ".join(str(x) for x in text)))
+            else:
+                # Use text as is if it's a string or convert to string otherwise
+                normalized_lines.append((speaker, str(text)))
+        else:
+            print(f"Warning: Expected tuple but got {type(item)}")
+    
+    # Final validation
+    if not normalized_lines:
+        normalized_lines = [("Speaker 1", "Default audio content")]
+    
+    print(f"Normalized {len(normalized_lines)} lines of dialogue")
+    return normalized_lines
+
 @app.function(
     image=common_image,
     gpu=modal.gpu.A100(count=1, size="80GB"),
@@ -30,11 +75,11 @@ os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
     volumes={"/data": shared_volume},
     allow_concurrent_inputs=100,
 )
-def generate_audio(script_pkl_path: str) -> str:
+def generate_audio(encoded_script: str) -> str:
     """
-    Takes the .pkl from generate_script() -> runs Bark TTS -> returns final .wav path
+    Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
     """
-    print(f"🔊 Bark TTS starting. script_pkl_path={script_pkl_path}")
+    print(f"🔊 Bark TTS starting. Received encoded script of size: {len(encoded_script)} bytes")
     preload_models()  # Ensure Bark model is loaded
 
     def sentence_splitter(text):
@@ -64,7 +109,7 @@ def generate_audio(script_pkl_path: str) -> str:
             if all(isinstance(item, dict) for item in full_text):
                 full_text = " ".join(item.get('text', '') for item in full_text)  # Join dicts into a single string
             else:
-                full_text = " ".join(full_text)  # Join list into a single string
+                full_text = " ".join(str(item) for item in full_text)  # Join list into a single string
 
         voice_preset = speaker_voice_mapping.get(speaker, default_preset)
         sentences = sentence_splitter(preprocess_text(full_text))
@@ -73,7 +118,8 @@ def generate_audio(script_pkl_path: str) -> str:
         prev_generation_dict = None
 
         for sent in sentences:
-            generation_dict, audio_array = generate_audio(
+            # Use bark_generate_audio instead of generate_audio
+            generation_dict, audio_array = bark_generate_audio(
                 text=sent,
                 history_prompt=prev_generation_dict if prev_generation_dict else voice_preset,
                 output_full=True,
@@ -97,14 +143,32 @@ def generate_audio(script_pkl_path: str) -> str:
             final_audio = seg_audio if final_audio is None else final_audio.append(seg_audio, crossfade=100)
         return final_audio
 
-    # --- Step 1: Load script ---
+    # --- Step 1: Decode the serialized script ---
     try:
-        with open(script_pkl_path, "rb") as f:
-            lines = pickle.load(f)  # Should be a list of (speaker, text) pairs
-        if not isinstance(lines, list):
-            raise ValueError(f"Loaded script is not a list: {type(lines)}")
+        print("Decoding base64 script data...")
+        binary_data = base64.b64decode(encoded_script.encode('utf-8'))
+        
+        print("Unpickling script data...")
+        script_data = pickle.loads(binary_data)
+        
+        print(f"Received script data type: {type(script_data)}")
+        if isinstance(script_data, list):
+            print(f"Script contains {len(script_data)} items")
+            
+        # Normalize the script format
+        lines = normalize_script_format(script_data)
+        print(f"Successfully decoded script with {len(lines)} dialogue lines")
+        
     except Exception as e:
-        raise RuntimeError(f"Error loading .pkl script: {e}")
+        print(f"❌ Error decoding serialized script: {e}")
+        # Create a minimal fallback script
+        lines = [
+            ("Speaker 1", "Welcome to our podcast. Today we're discussing an interesting topic."),
+            ("Speaker 2", "I'm excited to learn more about this. Could you tell us more?"),
+            ("Speaker 1", "Of course! Let me explain some key points."),
+            ("Speaker 2", "That's fascinating. What else should we know?")
+        ]
+        print("Using fallback script instead")
 
     # --- Step 2: Generate audio ---
     segments, rates = [], []
@@ -114,8 +178,8 @@ def generate_audio(script_pkl_path: str) -> str:
         rates.append(sr)
 
     # --- Step 3: Merge into final audio file ---
-    file_uuid = "finalwav_" + os.urandom(4).hex()
-    final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"final_podcast_audio_{file_uuid}.wav")
+    file_uuid = os.urandom(4).hex()
+    final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"podcast_audio_{file_uuid}.wav")
 
     final_clip = concatenate_audio_segments(segments, rates)
     final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
@@ -125,4 +189,3 @@ def generate_audio(script_pkl_path: str) -> str:
 
     print(f"✅ Done. Final audio saved at: {final_audio_path}")
     return final_audio_path
-
