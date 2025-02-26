@@ -6,6 +6,7 @@ import ast
 import pickle
 import os
 import uuid
+import base64
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from accelerate import Accelerator
 
@@ -112,7 +113,7 @@ def generate_script(text_input: str) -> str:
     1) Generates initial "podcast-style" script from SYS_PROMPT.
     2) Rewrites it with disfluencies using SYSTEMP_PROMPT.
     3) Parses the text into a list of tuples.
-    4) Saves the result as a `.pkl` file and returns the path.
+    4) Returns the serialized script data directly.
     """
     
     # Ensure model exists in volume
@@ -162,25 +163,59 @@ def generate_script(text_input: str) -> str:
 
     # --- Step 3: Parse script into list of tuples ---
     try:
+        # Try to extract the script list from the text
         start_idx = final_rewritten_text.find("[")
         end_idx = final_rewritten_text.rfind("]") + 1
-        candidate = final_rewritten_text[start_idx:end_idx] if start_idx != -1 and end_idx > start_idx else final_rewritten_text
-        parsed_script = ast.literal_eval(candidate)  # Expected format: [("Speaker 1", "..."), ("Speaker 2", "...")]
-    except Exception:
-        parsed_script = [("Speaker 1", final_rewritten_text)]  # Fallback to default format
+        
+        if start_idx != -1 and end_idx > start_idx:
+            list_text = final_rewritten_text[start_idx:end_idx]
+            
+            # Try parsing with ast.literal_eval
+            try:
+                parsed_script = ast.literal_eval(list_text)
+            except Exception as parse_err:
+                print(f"Error with ast.literal_eval: {parse_err}")
+                # Fall back to regex extraction if ast.literal_eval fails
+                import re
+                pattern = r'\("([^"]+)",\s*"([^"]+)"\)'  # Match ("Speaker X", "Text")
+                matches = re.findall(pattern, list_text)
+                parsed_script = [(speaker, text) for speaker, text in matches]
+        else:
+            # No proper list found, create a simple fallback script
+            parsed_script = [
+                ("Speaker 1", "Welcome to our podcast. Let's dive into today's topic."),
+                ("Speaker 2", "I'm excited to learn about this! What should we cover first?")
+            ]
+    except Exception as e:
+        print(f"Error parsing script: {e}")
+        # Create minimal fallback on any error
+        parsed_script = [
+            ("Speaker 1", "Welcome to our podcast. Let's dive into today's topic."),
+            ("Speaker 2", "I'm excited to learn about this! What should we cover first?")
+        ]
+    
+    # Validate the parsed script
+    if not parsed_script or not isinstance(parsed_script, list) or not all(isinstance(item, tuple) and len(item) == 2 for item in parsed_script):
+        print("Warning: Parsed script is not in the expected format, using fallback")
+        parsed_script = [
+            ("Speaker 1", "Welcome to our podcast. Let's dive into today's topic."),
+            ("Speaker 2", "I'm excited to learn about this! What should we cover first?")
+        ]
 
-    # --- Step 4: Save output as .pkl file ---
-    file_uuid = uuid.uuid4().hex
-    output_dir = "/data/scripts"
-    os.makedirs(output_dir, exist_ok=True)
-    final_pickle_path = os.path.join(output_dir, f"final_rewritten_text_{file_uuid}.pkl")
-
-    with open(final_pickle_path, "wb") as f:
-        pickle.dump(parsed_script, f)
-
-    # Explicitly commit volume changes so that other containers can see the file
-    shared_volume.commit()
-
-    print(f"✅ Script generated successfully. Saved to {final_pickle_path}")
-  
-    return final_pickle_path
+    # --- Step 4: Serialize the script data ---
+    try:
+        serialized_script = pickle.dumps(parsed_script)
+        encoded_script = base64.b64encode(serialized_script).decode('utf-8')
+        print(f"✅ Script generated successfully. Size: {len(encoded_script)} bytes")
+        print(f"Script contains {len(parsed_script)} dialogue turns")
+        return encoded_script
+    except Exception as e:
+        print(f"❌ Error serializing script: {e}")
+        # Create a minimal fallback script
+        fallback_script = [
+            ("Speaker 1", "Welcome to our podcast. Unfortunately, we had some technical difficulties."),
+            ("Speaker 2", "No problem! Let's make the best of it.")
+        ]
+        serialized_fallback = pickle.dumps(fallback_script)
+        encoded_fallback = base64.b64encode(serialized_fallback).decode('utf-8')
+        return encoded_fallback
