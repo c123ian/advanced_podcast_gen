@@ -1,377 +1,237 @@
 import modal
-import os
-import sqlite3
-import uuid
-from typing import Optional
 import torch
-from fasthtml.common import (
-    fast_app, H1, P, Div, Form, Input, Button, Group,
-    Title, Main
-)
-# Core PDF support - required
-import PyPDF2
-
-# Optional format support
-import whisper
-
-from langchain_community.document_loaders import WebBaseLoader
-
-from langchain_community.document_loaders import WebBaseLoader
+import os
+import ast
+import pickle
+import base64
+from typing import Optional, List, Tuple
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from accelerate import Accelerator
 from common_image import common_image, shared_volume
 
+# Define app
+app = modal.App("scripts_gen")
 
-import modal
+# Constants
+DATA_DIR = "/data"
+SCRIPTS_FOLDER = "/data/podcast_scripts"
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Ensure these functions reference the correct deployed app
-generate_script = modal.Function.from_name("multi-file-podcast", "generate_script")
-generate_audio = modal.Function.from_name("multi-file-podcast", "generate_audio")
+# Create necessary directories
+os.makedirs(SCRIPTS_FOLDER, exist_ok=True)
 
+# System prompts for script generation
+SYSTEM_PROMPT = """
+You are a world-class podcast writer, having ghostwritten for top shows like Joe Rogan, Lex Fridman, and Tim Ferris.
+Your job is to write a lively, engaging script with two speakers based on the text I provide.
+Speaker 1 leads the conversation, teaching Speaker 2, giving anecdotes and analogies.
+Speaker 2 asks follow-up questions, gets excited or confused, and interrupts with "umm, hmm" occasionally.
 
-# HELPER CLASSES
+ALWAYS START YOUR RESPONSE WITH 'SPEAKER 1' and a colon.
+Keep the conversation extremely engaging, welcome the audience with a fun overview, etc.
+"""
 
+REWRITE_PROMPT = """
+You are an Oscar-winning screenwriter rewriting a transcript for an AI Text-To-Speech Pipeline.
+Re-inject disfluencies like "umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — or ... for hesitations, CAPITALIZATION for emphasis of a word" and ensure there's a real back-and-forth.
+Return your final answer as a Python LIST of (Speaker, text) TUPLES ONLY, NO EXPLANATIONS, e.g.
 
+[
+    ("Speaker 1", "Hello, and welcome..."),
+    ("Speaker 2", "Hmm, that is fascinating!")
+]
 
-class BaseIngestor:
-    """Base class for all ingestors"""
-    def validate(self, source: str) -> bool:
-        pass
-    def extract_text(self, source: str, max_chars: int = 100000) -> Optional[str]:
-        pass
+IMPORTANT Your response must be a valid Python list of tuples.
+"""
 
-class PDFIngestor(BaseIngestor):
-    """PDF ingestion - core functionality"""
-    def validate(self, file_path: str) -> bool:
-        if not os.path.exists(file_path):
-            print(f"Error: File not found at path: {file_path}")
-            return False
-        if not file_path.lower().endswith('.pdf'):
-            print("Error: File is not a PDF")
-            return False
-        return True
-    def extract_text(self, file_path: str, max_chars: int = 100000) -> Optional[str]:
-        if not self.validate(file_path):
-            return None
-        try:
-            with open(file_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                num_pages = len(pdf_reader.pages)
-                print(f"Processing PDF with {num_pages} pages...")
-                extracted_text = []
-                total_chars = 0
-                for page_num in range(num_pages):
-                    page_text = pdf_reader.pages[page_num].extract_text()
-                    if page_text:
-                        total_chars += len(page_text)
-                        if total_chars > max_chars:
-                            remaining_chars = max_chars - total_chars
-                            extracted_text.append(page_text[:remaining_chars])
-                            print(f"Reached {max_chars} character limit at page {page_num + 1}")
-                            break
-                        extracted_text.append(page_text)
-                        print(f"Processed page {page_num + 1}/{num_pages}")
-                return "\n".join(extracted_text)
-        except PyPDF2.PdfReadError:
-            print("Error: Invalid or corrupted PDF file")
-            return None
-        except Exception as e:
-            print(f"An unexpected error occurred: {str(e)}")
-            return None
+def clean_llm_output(text: str) -> str:
+    """Remove prompt instructions from the LLM output"""
+    # List of markers that indicate where the actual content starts
+    content_markers = [
+        'SPEAKER 1:', 
+        'Speaker 1:',
+        'Speaker 1,', 
+        'SPEAKER 1 ,',  
+        '[("Speaker 1"',
+        '[("SPEAKER 1"'
+    ]
+    
+    # Find the earliest occurrence of any marker
+    start_index = float('inf')
+    for marker in content_markers:
+        idx = text.find(marker)
+        if idx != -1 and idx < start_index:
+            start_index = idx
+    
+    if start_index == float('inf'):
+        return text
+    
+    return text[start_index:]
 
-class WebsiteIngestor(BaseIngestor):
-    """Website ingestion using LangChain's WebBaseLoader"""
-    def validate(self, url: str) -> bool:
-        if not url.startswith(('http://', 'https://')):
-            print("Error: Invalid URL format")
-            return False
-        return True
-    def extract_text(self, url: str, max_chars: int = 100000) -> Optional[str]:
-        if not self.validate(url):
-            return None
-        try:
-            loader = WebBaseLoader(url)
-            documents = loader.load()
-            extracted_text = "\n".join([doc.page_content for doc in documents])
-            if len(extracted_text) > max_chars:
-                extracted_text = extracted_text[:max_chars]
-                print(f"Truncated extracted text to {max_chars} characters")
-            print(f"Extracted text from website: {url}")
-            return extracted_text
-        except Exception as e:
-            print(f"An error occurred while extracting from website: {str(e)}")
-            return None
-
-class AudioIngestor(BaseIngestor):
-    """Audio ingestion using OpenAI's Whisper model"""
-    def __init__(self, model_type: str = "base"):
-        self.model_type = model_type
-        self.model = whisper.load_model(self.model_type)
-    def validate(self, audio_file: str) -> bool:
-        if not os.path.exists(audio_file):
-            print(f"Error: Audio file not found at path: {audio_file}")
-            return False
-        if not audio_file.lower().endswith(('.mp3', '.wav', '.flac', '.m4a')):
-            print("Error: Unsupported audio format. Supported formats are .mp3, .wav, .flac, .m4a")
-            return False
-        return True
-    def extract_text(self, audio_file: str, max_chars: int = 100000) -> Optional[str]:
-        if not self.validate(audio_file):
-            return None
-        try:
-            result = self.model.transcribe(audio_file)
-            transcription = result["text"]
-            if len(transcription) > max_chars:
-                transcription = transcription[:max_chars]
-                print(f"Truncated transcription to {max_chars} characters")
-            print(f"Transcribed audio file: {audio_file}")
-            return transcription
-        except Exception as e:
-            print(f"An error occurred during audio transcription: {str(e)}")
-            return None
-
-class IngestorFactory:
-    """Factory to create appropriate ingestor based on input type"""
-    @staticmethod
-    def get_ingestor(input_type: str, **kwargs) -> Optional[BaseIngestor]:
-        input_type = input_type.lower()
-        if input_type == "pdf":
-            return PDFIngestor()
-        elif input_type == "website":
-            return WebsiteIngestor()
-        elif input_type == "audio":
-            return AudioIngestor(**kwargs)
-        else:
-            print(f"Unsupported input type: {input_type}")
-            return None
-        
-class TextIngestor(BaseIngestor):
-    """Simple ingestor for .txt or .md files."""
-    def validate(self, file_path: str) -> bool:
-        if not os.path.isfile(file_path):
-            print(f"Error: File not found at path: {file_path}")
-            return False
-        if not (file_path.lower().endswith('.txt') or file_path.lower().endswith('.md')):
-            print("Error: File is not .txt or .md")
-            return False
-        return True
-
-    def extract_text(self, file_path: str, max_chars: int = 100000) -> Optional[str]:
-        if not self.validate(file_path):
-            return None
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            if len(text) > max_chars:
-                print(f"Truncating text to {max_chars} chars")
-                text = text[:max_chars]
-            print(f"Extracted text from: {file_path}")
-            return text
-        except Exception as e:
-            print(f"Error reading text file: {e}")
-            return None
-
-
-class IngestorFactory:
-    @staticmethod
-    def get_ingestor(input_type: str, **kwargs) -> Optional[BaseIngestor]:
-        input_type = input_type.lower()
-        if input_type == "pdf":
-            return PDFIngestor()
-        elif input_type == "website":
-            return WebsiteIngestor()
-        elif input_type == "audio":
-            return AudioIngestor(**kwargs)
-        elif input_type == "text":
-            return TextIngestor()  # <-- new line here
-        else:
-            print(f"Unsupported input type: {input_type}")
-            return None
-        
-# Create Modal App
-app = modal.App("content_injection")
-
-# Directories
-UPLOAD_DIR = "/data/uploads"
-OUTPUT_DIR = "/data/processed"
-DB_PATH = "/data/injections.db"
-
-# Ensure Directories Exist
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-# Setup Database
-def setup_database(db_path: str):
-    """Initialize SQLite database for tracking injections"""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS injections (
-            id TEXT PRIMARY KEY,
-            original_filename TEXT NOT NULL,
-            input_type TEXT NOT NULL,
-            processed_path TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    return conn
-
-# Determine Input Type
-def get_input_type(filename: str) -> str:
-    """Classifies input type based on filename or URL"""
-    lower_filename = filename.lower()
-    if lower_filename.endswith('.pdf'):
-        return 'pdf'
-    elif lower_filename.endswith(('.mp3', '.wav', '.m4a', '.flac')):
-        return 'audio'
-    elif lower_filename.startswith(('http://', 'https://')):
-        return 'website'
-    elif lower_filename.endswith(('.txt', '.md')):
-        return 'text'
-    else:
-        raise ValueError(f"Unsupported file type: {filename}")
-
-# Process Uploaded Content
-def process_content(source_path: str, input_type: str, max_chars: int = 100000) -> Optional[str]:
-    """Processes content using the appropriate ingestor"""
-    ingestor = IngestorFactory.get_ingestor(input_type)
-    if not ingestor:
-        print(f"❌ No ingestor found for type: {input_type}")
-        return None
-    return ingestor.extract_text(source_path, max_chars)
-
-# Start Modal App with ASGI
-@app.function(
-    image=common_image,
-    volumes={"/data": shared_volume},
-    gpu=modal.gpu.T4(count=1),
-    timeout=3600
-)
-@modal.asgi_app()
-def serve():
-    """Main FastHTML Server"""
-    conn = setup_database(DB_PATH)
-    fasthtml_app, rt = fast_app()
-
-    @rt("/")
-    def homepage():
-        """Render upload form"""
-        upload_input = Input(
-            type="file",
-            name="content",
-            accept=".pdf,.txt,.md,.mp3,.wav,.m4a,.flac",
-            required=False
-        )
-        url_input = Input(
-            type="text",
-            name="url",
-            placeholder="Or enter website URL",
-            cls="w-full px-3 py-2 border rounded"
-        )
-
-        form = Form(
-            Group(
-                upload_input,
-                url_input,
-                Button("Process Content"),
-                cls="space-y-4"
-            ),
-            hx_post="/inject",
-            hx_swap="afterbegin",
-            enctype="multipart/form-data",
-            method="post",
-        )
-
-        return Title("Content Injection"), Main(
-            H1("Upload Content for Podcast Generation"),
-            P("Upload a file or provide a URL to process content for podcast generation."),
-            form,
-            Div(id="injection-status")
-        )
-
-    # Update this section in input_gen.py where you call the Modal functions
-
-# MODIFIED VERSION OF THE inject_content FUNCTION - REPLACE THE EXISTING FUNCTION WITH THIS
-
-    @rt("/inject", methods=["POST"])
-    async def inject_content(request):
-        """Handles content ingestion and starts the podcast generation pipeline."""
-        form = await request.form()
-        injection_id = uuid.uuid4().hex
-
-        try:
-            # Handle File Upload or URL
-            if "content" in form and form["content"].filename:
-                file_field = form["content"]
-                original_filename = file_field.filename
-                input_type = get_input_type(original_filename)
-                save_path = os.path.join(UPLOAD_DIR, f"upload_{injection_id}{os.path.splitext(original_filename)[1]}")
-                content = await file_field.read()
-                with open(save_path, "wb") as f:
-                    f.write(content)
-            elif "url" in form and form["url"].strip():
-                url = form["url"].strip()
-                input_type = get_input_type(url)
-                save_path = url
-                original_filename = url
-            else:
-                return Div(
-                    P("⚠️ Please select a file or provide a URL."),
-                    id="injection-status",
-                    cls="text-red-500"
-                )
-
-            # Extract Text Content
-            processed_text = process_content(save_path, input_type)
-            if not processed_text:
-                return Div(
-                    P("❌ Failed to process content"),
-                    id="injection-status",
-                    cls="text-red-500"
-                )
-
-            # Call the Modal functions using `.remote(...)`
-            print(f"🚀 Kicking off script generation for text of length: {len(processed_text)} characters...")
+def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
+    """Parse the generated text into a list of speaker-text tuples"""
+    # Clean the output first
+    cleaned_text = clean_llm_output(text)
+    
+    try:
+        # Extract everything between the first [ and last ]
+        start_idx = cleaned_text.find("[")
+        end_idx = cleaned_text.rfind("]") + 1
+        if start_idx == -1 or end_idx == 0:
+            # If no brackets found, try to parse line by line
+            lines = cleaned_text.split('\n')
+            script = []
+            current_speaker = None
+            current_text = []
             
-            try:
-                # Generate script and get back serialized data directly
-                encoded_script = generate_script.remote(processed_text)
-                print(f"✅ Script generation complete. Received encoded data of length: {len(encoded_script)} bytes")
-                
-                # Pass the serialized script directly to audio generation
-                print("🔊 Kicking off audio generation...")
-                final_audio_path = generate_audio.remote(encoded_script)
-                
-                # Return Success Response
-                return Div(
-                    P(f"✅ Content processed successfully! ID: {injection_id}"),
-                    P(f"Podcast saved at: {final_audio_path}"),
-                    id="injection-status",
-                    cls="text-green-500"
-                )
-            except Exception as pipeline_err:
-                error_message = str(pipeline_err)
-                print(f"❌ Pipeline error: {error_message}")
-                return Div(
-                    P(f"⚠️ Error in generation pipeline: {error_message}"),
-                    id="injection-status",
-                    cls="text-red-500"
-                )
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if ':' in line:
+                    if current_speaker and current_text:
+                        script.append((current_speaker, ' '.join(current_text)))
+                        current_text = []
+                    
+                    parts = line.split(':', 1)
+                    current_speaker = parts[0].strip()
+                    if len(parts) > 1:
+                        current_text.append(parts[1].strip())
+                else:
+                    if current_speaker:
+                        current_text.append(line)
+            
+            if current_speaker and current_text:
+                script.append((current_speaker, ' '.join(current_text)))
+            
+            return script if script else [("Speaker 1", cleaned_text)]
+            
+        # Try to parse the content between brackets
+        candidate = cleaned_text[start_idx:end_idx]
+        final_script = ast.literal_eval(candidate)
+        
+        if not isinstance(final_script, list):
+            return [("Speaker 1", cleaned_text)]
+            
+        return final_script
+        
+    except Exception as e:
+        print(f"Parsing error: {str(e)}")
+        # Fallback to basic parsing if ast.literal_eval fails
+        try:
+            lines = cleaned_text.split('\n')
+            script = []
+            for line in lines:
+                if ':' in line:
+                    parts = line.split(':', 1)
+                    speaker = parts[0].strip()
+                    text = parts[1].strip() if len(parts) > 1 else ""
+                    script.append((speaker, text))
+            return script if script else [("Speaker 1", cleaned_text)]
+        except Exception as e2:
+            print(f"Fallback parsing error: {str(e2)}")
+            return [("Speaker 1", cleaned_text)]
 
-        except Exception as e:
-            error_message = str(e)
-            print(f"❌ Error processing content: {error_message}")
-            return Div(
-                P(f"⚠️ Error processing content: {error_message}"),
-                id="injection-status",
-                cls="text-red-500"
-            )
+# Load Llama8B specific image
+llama_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .apt_install("git")
+    .pip_install(
+        "transformers==4.46.1",
+        "accelerate>=0.26.0",
+        "torch>=2.0.0",
+        "sentencepiece"
+    )
+)
 
+# Look up Llama model volume
+try:
+    llm_volume = modal.Volume.lookup("llamas_8b", create_if_missing=False)
+    LLAMA_DIR = "/llamas_8b"
+    print("Llama 8B model volume found")
+except modal.exception.NotFoundError:
+    # Fall back to using the common image if Llama model not available
+    llm_volume = None
+    LLAMA_DIR = None
+    print("Warning: 'llamas_8b' volume not found. Will use OpenAI API fallback if configured.")
 
-    return fasthtml_app
+@app.function(
+    image=llama_image if LLAMA_DIR else common_image,
+    gpu=modal.gpu.A100(count=1, size="80GB") if LLAMA_DIR else modal.gpu.T4(count=1),
+    container_idle_timeout=10 * 60,
+    timeout=24 * 60 * 60,
+    volumes={LLAMA_DIR: llm_volume, "/data": shared_volume} if LLAMA_DIR else {"/data": shared_volume},
+)
+def generate_script(source_text: str) -> str:
+    """
+    Generates a podcast script from source text.
+    Returns the base64 encoded pickled script (list of tuples).
+    """
+    print(f"🚀 Generating script from text of length: {len(source_text)} characters")
+    
+    if LLAMA_DIR:
+        # Use local Llama model
+        print("Loading Llama model...")
+        accelerator = Accelerator()
+        model = AutoModelForCausalLM.from_pretrained(
+            LLAMA_DIR,
+            torch_dtype=torch.bfloat16,
+            device_map=device
+        )
+        tokenizer = AutoTokenizer.from_pretrained(LLAMA_DIR)
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({'pad_token': '<pad>'})
+            
+        model, tokenizer = accelerator.prepare(model, tokenizer)
+        
+        generation_pipe = pipeline(
+            "text-generation",
+            model=model,
+            tokenizer=tokenizer,
+            device_map="auto",
+            max_new_tokens=1500,
+            temperature=1.0,
+        )
 
-if __name__ == "__main__":
-    with modal.app.run():
-        serve()  # Starts the FastHTML server with the correct function references
+        # Generate initial script
+        print("Generating initial script...")
+        prompt_1 = SYSTEM_PROMPT + "\n\n" + source_text
+        first_draft = generation_pipe(prompt_1)[0]["generated_text"]
 
+        # Rewrite with disfluencies
+        print("Adding natural speech patterns...")
+        prompt_2 = REWRITE_PROMPT + "\n\n" + first_draft
+        final_text = generation_pipe(prompt_2)[0]["generated_text"]
+
+    else:
+        # Add OpenAI fallback here if needed
+        print("Using OpenAI API fallback (not implemented)")
+        # This would be where you add OpenAI API call code
+        final_text = f"""
+        [
+            ("Speaker 1", "Using OpenAI API fallback Welcome to our podcast! Today we're discussing an interesting topic from the provided content."),
+            ("Speaker 2", "Hmm, sounds fascinating! What's it about?"),
+            ("Speaker 1", "It's about {source_text[:100]}..."),
+            ("Speaker 2", "Tell me more about that!")
+        ]
+        """
+
+    # Parse into structured format
+    final_script = parse_podcast_script(final_text)
+    
+    # Save the script to a file for debugging/reference
+    import uuid
+    file_uuid = uuid.uuid4().hex
+    pkl_path = os.path.join(SCRIPTS_FOLDER, f"script_{file_uuid}.pkl")
+    
+    with open(pkl_path, "wb") as f:
+        pickle.dump(final_script, f)
+    
+    print(f"Script saved to {pkl_path} with {len(final_script)} lines of dialogue")
+    
+    # Serialize the script for passing to the audio generation function
+    serialized_data = pickle.dumps(final_script)
+    encoded_data = base64.b64encode(serialized_data).decode('utf-8')
+    
+    return encoded_data
