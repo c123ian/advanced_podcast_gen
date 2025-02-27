@@ -33,7 +33,7 @@ Keep the conversation extremely engaging, welcome the audience with a fun overvi
 
 REWRITE_PROMPT = """
 You are an Oscar-winning screenwriter rewriting a transcript for an AI Text-To-Speech Pipeline.
-Re-inject disfluencies like "umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — or ... for hesitations, CAPITALIZATION for emphasis of a word" and ensure there's a real back-and-forth.
+Re-inject disfluencies BUT ONLY THESE FOLLOWING disfluencies "umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — for hesitations, CAPITALIZATION for emphasis of a word" and ensure there's a real back-and-forth.
 Return your final answer as a Python LIST of (Speaker, text) TUPLES ONLY, NO EXPLANATIONS, e.g.
 
 [
