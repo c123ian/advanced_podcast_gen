@@ -114,7 +114,8 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         voice_preset = speaker_voice_mapping.get(speaker, default_preset)
         sentences = sentence_splitter(preprocess_text(full_text))
         all_audio = []
-        chunk_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)
+        # For shorter silence (e.g., 0.1 seconds instead of 0.25)
+        chunk_silence = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
         prev_generation_dict = None
 
         for sent in sentences:
