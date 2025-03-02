@@ -75,7 +75,7 @@ def normalize_script_format(script_data):
     volumes={"/data": shared_volume},
     allow_concurrent_inputs=100,
 )
-def generate_audio(encoded_script: str) -> str:
+def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     """
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
     """
@@ -178,11 +178,33 @@ def generate_audio(encoded_script: str) -> str:
         rates.append(sr)
 
     # --- Step 3: Merge into final audio file ---
-    file_uuid = os.urandom(4).hex()
+    # Use injection_id in the filename if provided
+    if injection_id:
+        file_uuid = f"{injection_id}_{os.urandom(2).hex()}"
+    else:
+        file_uuid = os.urandom(4).hex()
+        
     final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"podcast_audio_{file_uuid}.wav")
 
     final_clip = concatenate_audio_segments(segments, rates)
     final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
+
+    # Update database if injection_id is provided
+    if injection_id:
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections.db"
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE injections SET processed_path = ?, status = 'completed' WHERE id = ?",
+                (final_audio_path, injection_id)
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Database updated for injection ID: {injection_id}")
+        except Exception as e:
+            print(f"⚠️ Error updating database: {e}")
 
     # Explicitly commit volume changes so other containers can access it
     shared_volume.commit()
