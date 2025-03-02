@@ -6,7 +6,7 @@ from typing import Optional
 import torch
 from fasthtml.common import (
     fast_app, H1, P, Div, Form, Input, Button, Group,
-    Title, Main
+    Title, Main, Audio
 )
 # Core PDF support - required
 import PyPDF2
@@ -256,7 +256,7 @@ def serve():
 
     @rt("/")
     def homepage():
-        """Render upload form"""
+        """Render upload form with status checker"""
         upload_input = Input(
             type="file",
             name="content",
@@ -270,7 +270,7 @@ def serve():
             cls="w-full px-3 py-2 border rounded"
         )
 
-        form = Form(
+        upload_form = Form(
             Group(
                 upload_input,
                 url_input,
@@ -282,12 +282,33 @@ def serve():
             enctype="multipart/form-data",
             method="post",
         )
+        
+        status_form = Form(
+            Group(
+                Input(
+                    type="text",
+                    name="injection_id",
+                    placeholder="Enter your podcast ID",
+                    cls="w-full px-3 py-2 border rounded"
+                ),
+                Button("Check Status"),
+                cls="space-y-4"
+            ),
+            action="/status-redirect",
+            method="get",
+        )
 
         return Title("Content Injection"), Main(
             H1("Upload Content for Podcast Generation"),
             P("Upload a file or provide a URL to process content for podcast generation."),
-            form,
-            Div(id="injection-status")
+            upload_form,
+            Div(id="injection-status"),
+            Div(
+                H1("Check Existing Podcast Status", cls="mt-8"),
+                P("Already have a podcast ID? Check its status:"),
+                status_form,
+                cls="mt-10 pt-8 border-t"
+            )
         )
 
     @rt("/inject", methods=["POST"])
@@ -327,17 +348,30 @@ def serve():
                     cls="text-red-500"
                 )
 
+            # Insert record into database
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO injections (id, original_filename, input_type, status) VALUES (?, ?, ?, ?)",
+                (injection_id, original_filename, input_type, "processing")
+            )
+            conn.commit()
+            conn.close()
+
             # Call the Modal functions using `.remote(...)`
             print("🚀 Kicking off script generation...")
             script_pkl_path = generate_script.remote(processed_text)
 
             print("🔊 Kicking off audio generation...")
-            final_audio_path = generate_audio.remote(script_pkl_path)
-
-            # Return Success Response
+            # Generate the audio
+            audio_path = generate_audio.remote(script_pkl_path, injection_id)
+            
+            # Return a processing message with ID
             return Div(
-                P(f"✅ Content processed successfully! ID: {injection_id}"),
-                P(f"Podcast saved at: {final_audio_path}"),
+                P(f"✅ Content processed successfully! Your podcast is being generated."),
+                P(f"Your podcast ID is: {injection_id}"),
+                P("Copy this ID and use the status checker below to check when your podcast is ready."),
+                P("It usually takes 3-5 minutes to generate the audio."),
                 id="injection-status",
                 cls="text-green-500"
             )
@@ -349,10 +383,75 @@ def serve():
                 cls="text-red-500"
             )
 
+    @rt("/status/{injection_id}")
+    async def check_status(injection_id: str):
+        """Check status and display audio if ready"""
+        import base64
+        
+        # Check database for completion status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT processed_path, status FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return Title("Podcast Status"), Main(
+                H1("Podcast Status"),
+                P(f"No record found for ID: {injection_id}"),
+                cls="text-red-500"
+            )
+        
+        audio_path, status = result
+        
+        if status != "completed" or not audio_path:
+            return Title("Podcast Status"), Main(
+                H1("Podcast Status"),
+                P(f"Your podcast is still being generated. Status: {status}"),
+                P("Please check back in a few minutes."),
+                cls="text-blue-500"
+            )
+        
+        # File is ready - display the audio player
+        if os.path.exists(audio_path):
+            try:
+                with open(audio_path, "rb") as f:
+                    audio_data = f.read()
+                    b64_audio = base64.b64encode(audio_data).decode("ascii")
+                    
+                return Title("Your Podcast"), Main(
+                    H1("Your Podcast is Ready!"),
+                    P(f"ID: {injection_id}"),
+                    Audio(
+                        src=f"data:audio/wav;base64,{b64_audio}",
+                        controls=True,
+                        style="width: 100%;"
+                    )
+                )
+            except Exception as e:
+                return Title("Error"), Main(
+                    H1("Error"),
+                    P(f"Error loading audio file: {str(e)}"),
+                    cls="text-red-500"
+                )
+        else:
+            return Title("File Not Found"), Main(
+                H1("File Not Found"),
+                P(f"Audio file not found at expected location: {audio_path}"),
+                cls="text-red-500"
+            )
+
+    @rt("/status-redirect")
+    def status_redirect(injection_id: str):
+        """Redirect to the status page for an ID"""
+        from starlette.responses import RedirectResponse
+        return RedirectResponse(f"/status/{injection_id}")
 
     return fasthtml_app
 
 if __name__ == "__main__":
     with modal.app.run():
         serve()  # Starts the FastHTML server with the correct function references
-
