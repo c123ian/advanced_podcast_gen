@@ -106,6 +106,28 @@ def convert_disfluencies(text):
     
     return text
 
+
+def convert_disfluencies(text):
+    """
+    Convert parenthesized expressions like (laughs) to bracketed [laughs]
+    for proper TTS rendering.
+    """
+    disfluencies = [
+        "laughs", "sighs", "laughter", "gasps", "clears throat", 
+        "sigh", "laugh", "gasp",
+        "hmm", "umm"
+    ]
+    
+    # First check for parenthesized expressions
+    for disfluency in disfluencies:
+        # Convert (laughs) to [laughs]
+        text = re.sub(r'\(' + disfluency + r'\)', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+        
+        # Also convert <laughs> to [laughs] if present
+        text = re.sub(r'<' + disfluency + r'>', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+    
+    return text
+
 def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
     """Parse the generated text into a list of speaker-text tuples"""
     # Clean the output first
