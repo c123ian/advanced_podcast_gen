@@ -8,6 +8,7 @@ from typing import Optional, List, Tuple
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from accelerate import Accelerator
 from common_image import common_image, shared_volume
+import re
 
 # Define app
 app = modal.App("scripts_gen")
@@ -28,20 +29,35 @@ Speaker 1 leads the conversation, teaching Speaker 2, giving anecdotes and analo
 Speaker 2 asks follow-up questions, gets excited or confused, and interrupts with "umm, hmm" occasionally.
 
 ALWAYS START YOUR RESPONSE WITH 'SPEAKER 1' and a colon.
+DO NOT GIVE SPEAKERS NAMES.
 Keep the conversation extremely engaging, welcome the audience with a fun overview, etc.
+Only create ONE EPISODE of the podcast. 
+The speakers discussing a the topic as external commentators.
 """
 
 REWRITE_PROMPT = """
 You are an Oscar-winning screenwriter rewriting a transcript for an AI Text-To-Speech Pipeline.
-Re-inject disfluencies BUT ONLY THESE FOLLOWING disfluencies "umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — for hesitations, CAPITALIZATION for emphasis of a word" and ensure there's a real back-and-forth.
+
+Make it as engaging as possible, Speaker 1 and 2 will be using different voices.
+
+It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
+
+Please re-write to make it as characteristic as possible
+
+For both Speakers use the following disfluencies FREQUENTLY AS MUCH AS POSSIBLE, umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — for hesitations, CAPITALIZATION for emphasis. BUT ONLY THESE OPTIONS FOR EXPRESSIONS
+
 Return your final answer as a Python LIST of (Speaker, text) TUPLES ONLY, NO EXPLANATIONS, e.g.
+
+Dont add "quotation marks" within the script dialogue. 
+
+IT WILL START DIRECTLY WITH THE LIST AND END WITH THE LIST NOTHING ELSE
 
 [
     ("Speaker 1", "Hello, and welcome..."),
     ("Speaker 2", "Hmm, that is fascinating!")
 ]
 
-IMPORTANT Your response must be a valid Python list of tuples.
+IMPORTANT Your response must be a valid Python list of tuples. STRICTLY RETURN YOUR RESPONSE AS A LIST OF TUPLES
 """
 
 def clean_llm_output(text: str) -> str:
@@ -67,6 +83,28 @@ def clean_llm_output(text: str) -> str:
         return text
     
     return text[start_index:]
+
+
+def convert_disfluencies(text):
+    """
+    Convert parenthesized expressions like (laughs) to bracketed [laughs]
+    for proper TTS rendering.
+    """
+    disfluencies = [
+        "laughs", "sighs", "laughter", "gasps", "clears throat", 
+        "sigh", "laugh", "gasp",
+        "hmm", "umm"
+    ]
+    
+    # First check for parenthesized expressions
+    for disfluency in disfluencies:
+        # Convert (laughs) to [laughs]
+        text = re.sub(r'\(' + disfluency + r'\)', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+        
+        # Also convert <laughs> to [laughs] if present
+        text = re.sub(r'<' + disfluency + r'>', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+    
+    return text
 
 def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
     """Parse the generated text into a list of speaker-text tuples"""
