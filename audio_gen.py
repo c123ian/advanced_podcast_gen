@@ -9,6 +9,8 @@ from tqdm import tqdm
 from common_image import common_image, shared_volume
 
 app = modal.App("audio_gen")
+# Create a shared dictionary for voice states
+voice_states = modal.Dict.from_name("voice-states", create_if_missing=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -116,7 +118,10 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         all_audio = []
         # For shorter silence (e.g., 0.1 seconds instead of 0.25)
         chunk_silence = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
-        prev_generation_dict = None
+        
+        # Get previous generation state from Dict if available
+        voice_state_key = f"{injection_id}_{speaker}" if injection_id else None
+        prev_generation_dict = voice_states.get(voice_state_key) if voice_state_key else None
 
         for sent in sentences:
             # Use bark_generate_audio instead of generate_audio
@@ -127,7 +132,13 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
                 text_temp=0.7,
                 waveform_temp=0.7,
             )
+            # Update for next sentence
             prev_generation_dict = generation_dict
+            
+            # Store the voice state in the Modal.Dict for consistency between function calls
+            if voice_state_key:
+                voice_states[voice_state_key] = generation_dict
+                
             all_audio.append(audio_array)
             all_audio.append(chunk_silence)
 
@@ -209,6 +220,15 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
 
     # Explicitly commit volume changes so other containers can access it
     shared_volume.commit()
+    
+    # Clean up voice state data after successful completion
+    if injection_id:
+        # Remove all voice states for this injection to free up space
+        for speaker in speaker_voice_mapping.keys():
+            voice_state_key = f"{injection_id}_{speaker}"
+            if voice_states.contains(voice_state_key):
+                voice_states.pop(voice_state_key)
+                print(f"Cleaned up voice state for {voice_state_key}")
 
     print(f"✅ Done. Final audio saved at: {final_audio_path}")
     return final_audio_path
