@@ -1,15 +1,17 @@
 import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time
 from scipy.io import wavfile
 from pydub import AudioSegment
-# Rename the imported function to avoid the conflict
-from bark import SAMPLE_RATE, preload_models, generate_audio as bark_generate_audio
+# Import the specific low-level Bark functions
+from bark import SAMPLE_RATE, preload_models
+from bark.generation import generate_text_semantic
+from bark.api import semantic_to_waveform
 from tqdm import tqdm
 
 # Import shared resources
 from common_image import common_image, shared_volume
 
 app = modal.App("audio_gen")
-# Create a shared dictionary for voice states
+# Create a shared dictionary for voice states (RNG seeds)
 voice_states = modal.Dict.from_name("voice-states", create_if_missing=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -104,43 +106,65 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
     default_preset = "v2/en_speaker_9"
 
-    def generate_speaker_audio_longform(full_text, speaker):
-        """Generates TTS audio for a given speaker and text"""
+    def generate_speaker_audio_lowlevel(full_text, speaker):
+        """Generates TTS audio for a given speaker and text using low-level Bark API"""
         if isinstance(full_text, list):
             # Check if the list contains dictionaries and extract the text
             if all(isinstance(item, dict) for item in full_text):
-                full_text = " ".join(item.get('text', '') for item in full_text)  # Join dicts into a single string
+                full_text = " ".join(item.get('text', '') for item in full_text)
             else:
-                full_text = " ".join(str(item) for item in full_text)  # Join list into a single string
+                full_text = " ".join(str(item) for item in full_text)
 
         voice_preset = speaker_voice_mapping.get(speaker, default_preset)
         sentences = sentence_splitter(preprocess_text(full_text))
         all_audio = []
-        # For shorter silence (e.g., 0.1 seconds instead of 0.25)
+        # Shorter silence between sentences
         chunk_silence = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
         
-        # Get previous generation state from Dict if available
+        # Get voice seed for consistency across distributed containers
         voice_state_key = f"{injection_id}_{speaker}" if injection_id else None
-        prev_generation_dict = voice_states.get(voice_state_key) if voice_state_key else None
-
-        for sent in sentences:
-            # Use bark_generate_audio instead of generate_audio
-            generation_dict, audio_array = bark_generate_audio(
-                text=sent,
-                history_prompt=prev_generation_dict if prev_generation_dict else voice_preset,
-                output_full=True,
-                text_temp=0.7,
-                waveform_temp=0.7,
-            )
-            # Update for next sentence
-            prev_generation_dict = generation_dict
-            
-            # Store the voice state in the Modal.Dict for consistency between function calls
+        
+        # Here's where we handle voice consistency - using RNG seeds
+        if voice_state_key and voice_states.contains(voice_state_key):
+            # Get the stored RNG seed
+            seed = voice_states.get(voice_state_key)
+            print(f"Using saved seed {seed} for {speaker}")
+        else:
+            # Create a new one - we use speaker name to help with consistency
+            speaker_num = 1 if speaker == "Speaker 1" else 2
+            seed = np.random.randint(10000 * speaker_num, 10000 * (speaker_num + 1) - 1)
             if voice_state_key:
-                voice_states[voice_state_key] = generation_dict
-                
+                voice_states[voice_state_key] = seed
+            print(f"Created new seed {seed} for {speaker}")
+        
+        # Set a fixed RNG seed for this speaker to maintain voice consistency
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        
+        # Generation parameters - lower temps = more consistent voice
+        text_temp = 0.6
+        waveform_temp = 0.6
+        
+        print(f"Processing {len(sentences)} sentences for {speaker} with voice {voice_preset}")
+        
+        for i, sent in enumerate(sentences):
+            # This is the direct low-level API approach
+            semantic_tokens = generate_text_semantic(
+                sent,
+                history_prompt=voice_preset,  # Always use the base voice preset
+                temp=text_temp,
+                min_eos_p=0.05,  # Lower threshold to prevent hallucinations
+            )
+            
+            audio_array = semantic_to_waveform(
+                semantic_tokens, 
+                history_prompt=voice_preset,  # Always use the base voice preset
+                temp=waveform_temp,
+            )
+            
             all_audio.append(audio_array)
-            all_audio.append(chunk_silence)
+            if i < len(sentences) - 1:  # Don't add silence after the last sentence
+                all_audio.append(chunk_silence)
 
         if not all_audio:
             return np.zeros(24000, dtype=np.float32), SAMPLE_RATE
@@ -184,10 +208,15 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
 
     # --- Step 2: Generate audio ---
     segments, rates = [], []
-    for speaker, text in tqdm(lines, desc="🔊 Generating speech", unit="sentence"):
-        arr, sr = generate_speaker_audio_longform(text, speaker)
+    # Add longer silence between different speakers (0.5 seconds like in notebook)
+    turn_silence = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+    
+    for speaker, text in tqdm(lines, desc="🔊 Generating speech", unit="line"):
+        arr, sr = generate_speaker_audio_lowlevel(text, speaker)
         segments.append(arr)
+        segments.append(turn_silence)  # Add half-second silence between turns
         rates.append(sr)
+        rates.append(sr)  # Need matching rate for silence
 
     # --- Step 3: Merge into final audio file ---
     # Use injection_id in the filename if provided
