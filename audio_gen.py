@@ -71,6 +71,16 @@ def normalize_script_format(script_data):
     print(f"Normalized {len(normalized_lines)} lines of dialogue")
     return normalized_lines
 
+
+def estimate_processing_time(lines):
+    """Provide a rough ETA based on script length"""
+    seconds_per_line = 50  # Your estimated processing time per line
+    total_seconds = len(lines) * seconds_per_line
+    minutes = total_seconds // 60
+    seconds = total_seconds % 60
+    return f"{minutes} minutes, {seconds} seconds"
+
+
 @app.function(
     image=common_image,
     gpu=modal.gpu.A100(count=1, size="80GB"),
@@ -194,6 +204,10 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         # Normalize the script format
         lines = normalize_script_format(script_data)
         print(f"Successfully decoded script with {len(lines)} dialogue lines")
+
+        # 50 seconds per line TTS generation estimate
+        estimated_time = estimate_processing_time(lines)
+        print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
         
     except Exception as e:
         print(f"❌ Error decoding serialized script: {e}")
@@ -208,8 +222,8 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
 
     # --- Step 2: Generate audio ---
     segments, rates = [], []
-    # Add longer silence between different speakers (0.5 seconds like in notebook)
-    turn_silence = np.zeros(int(0.5 * SAMPLE_RATE), dtype=np.float32)
+    # Add longer silence between different speakers (0.5 seconds like in notebook, or .25 of a sec)
+    turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)
     
     for speaker, text in tqdm(lines, desc="🔊 Generating speech", unit="line"):
         arr, sr = generate_speaker_audio_lowlevel(text, speaker)
