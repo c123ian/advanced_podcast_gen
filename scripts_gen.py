@@ -26,10 +26,10 @@ SYSTEM_PROMPT = """
 You are a world-class podcast writer, having ghostwritten for top shows like Joe Rogan, Lex Fridman, and Tim Ferris.
 Your job is to write a lively, engaging script with two speakers based on the text I provide.
 Speaker 1 leads the conversation, teaching Speaker 2, giving anecdotes and analogies.
-Speaker 2 asks follow-up questions, gets excited or confused, and interrupts with "umm, hmm" occasionally.
+Speaker 2 asks follow-up questions, gets excited or confused, and interrupts with umm, hmm occasionally.
 
 ALWAYS START YOUR RESPONSE WITH 'SPEAKER 1' and a colon.
-DO NOT GIVE SPEAKERS NAMES.
+PLEASE DO NOT GIVE OR MENTION THE SPEAKERS BY NAME.
 Keep the conversation extremely engaging, welcome the audience with a fun overview, etc.
 Only create ONE EPISODE of the podcast. 
 The speakers discussing a the topic as external commentators.
@@ -45,6 +45,8 @@ It should be a real podcast with every fine nuance documented in as much detail 
 Please re-write to make it as characteristic as possible
 
 For both Speakers use the following disfluencies FREQUENTLY AS MUCH AS POSSIBLE, umm, hmm, [laughs], [sighs], [laughter], [gasps], [clears throat], — for hesitations, CAPITALIZATION for emphasis. BUT ONLY THESE OPTIONS FOR EXPRESSIONS
+
+Do not use [excitedly], [trailing off)], [interrupting], [pauses] or anything else that is NOT an outlined above disfluency for expression.
 
 Return your final answer as a Python LIST of (Speaker, text) TUPLES ONLY, NO EXPLANATIONS, e.g.
 
@@ -90,42 +92,22 @@ def convert_disfluencies(text):
     Convert parenthesized expressions like (laughs) to bracketed [laughs]
     for proper TTS rendering.
     """
+    # List of common disfluencies to check for
     disfluencies = [
         "laughs", "sighs", "laughter", "gasps", "clears throat", 
-        "sigh", "laugh", "gasp",
-        "hmm", "umm"
+        "sigh", "laugh", "gasp", "chuckles", "snorts",
+        "hmm", "umm", "uh", "ah", "er", "um"
     ]
     
-    # First check for parenthesized expressions
+    # Convert (laughs) to [laughs]
     for disfluency in disfluencies:
-        # Convert (laughs) to [laughs]
-        text = re.sub(r'\(' + disfluency + r'\)', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+        # Look for various formats and convert them
+        text = re.sub(r'\((' + disfluency + r')\)', r'[\1]', text, flags=re.IGNORECASE)
+        text = re.sub(r'<(' + disfluency + r')>', r'[\1]', text, flags=re.IGNORECASE)
         
-        # Also convert <laughs> to [laughs] if present
-        text = re.sub(r'<' + disfluency + r'>', '[' + disfluency + ']', text, flags=re.IGNORECASE)
-    
-    return text
-
-
-def convert_disfluencies(text):
-    """
-    Convert parenthesized expressions like (laughs) to bracketed [laughs]
-    for proper TTS rendering.
-    """
-    disfluencies = [
-        "laughs", "sighs", "laughter", "gasps", "clears throat", 
-        "sigh", "laugh", "gasp",
-        "hmm", "umm"
-    ]
-    
-    # First check for parenthesized expressions
-    for disfluency in disfluencies:
-        # Convert (laughs) to [laughs]
-        text = re.sub(r'\(' + disfluency + r'\)', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+        # Also match when there's text inside
+        text = re.sub(r'\(([^)]*' + disfluency + r'[^)]*)\)', r'[\1]', text, flags=re.IGNORECASE)
         
-        # Also convert <laughs> to [laughs] if present
-        text = re.sub(r'<' + disfluency + r'>', '[' + disfluency + ']', text, flags=re.IGNORECASE)
-    
     return text
 
 def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
@@ -192,6 +174,35 @@ def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
         except Exception as e2:
             print(f"Fallback parsing error: {str(e2)}")
             return [("Speaker 1", cleaned_text)]
+
+
+def normalize_script_quotes(script):
+    """Normalize the entire script format to match the expected output."""
+    normalized_script = []
+    
+    for speaker, text in script:
+        # 1. Standardize speaker format (Speaker 1, Speaker 2)
+        if speaker.upper() == "SPEAKER 1":
+            speaker = "Speaker 1"
+        elif speaker.upper() == "SPEAKER 2":
+            speaker = "Speaker 2"
+        
+        # 2. Standardize all quotes - more thorough approach
+        # First, protect contractions
+        text = re.sub(r'(\w)\'(\w)', r'\1APOSTROPHE\2', text)
+        
+        # Replace all quotes (single and double) with double quotes
+        text = text.replace('"', '"').replace("'", '"')
+        
+        # Restore apostrophes in contractions
+        text = text.replace('APOSTROPHE', "'")
+        
+        # 3. Convert disfluencies format
+        text = convert_disfluencies(text)
+        
+        normalized_script.append((speaker, text))
+    
+    return normalized_script
 
 # Load Llama8B specific image
 llama_image = (
@@ -279,7 +290,19 @@ def generate_script(source_text: str) -> str:
 
     # Parse into structured format
     final_script = parse_podcast_script(final_text)
-    
+
+    # Normalize quotes and disfluencies
+    final_script = normalize_script_quotes(final_script)
+
+    # In generate_script function, right before saving the script:
+    # Check final script format
+    for i, (speaker, text) in enumerate(final_script):
+        # Final validation of format
+        if not (speaker == "Speaker 1" or speaker == "Speaker 2"):
+            final_script[i] = (f"Speaker {1 if '1' in speaker else 2}", text)
+
+    print(f"Final script format sample: {final_script[0]}")
+            
     # Save the script to a file for debugging/reference
     import uuid
     file_uuid = uuid.uuid4().hex
