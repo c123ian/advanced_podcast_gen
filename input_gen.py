@@ -237,7 +237,8 @@ def process_content(source_path: str, input_type: str, max_chars: int = 100000) 
 @app.function(
     image=common_image,
     volumes={"/data": shared_volume},
-    gpu=modal.gpu.T4(count=1),
+    cpu=8.0,
+    # gpu=modal.gpu.T4(count=1),
     timeout=3600
 )
 @modal.asgi_app()
