@@ -1,4 +1,4 @@
-import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time, sqlite3
+import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time
 from scipy.io import wavfile
 from pydub import AudioSegment
 # Import the specific low-level Bark functions
@@ -26,9 +26,6 @@ nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 # Define persistent storage path for audio files
 AUDIO_OUTPUT_DIR = "/data/podcast_audio"
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
-
-# Database path
-DB_PATH = "/data/injections.db"
 
 def normalize_script_format(script_data):
     """Ensures the script is in the correct format of (speaker, text) tuples"""
@@ -82,34 +79,6 @@ def estimate_processing_time(lines):
     minutes = total_seconds // 60
     seconds = total_seconds % 60
     return f"{minutes} minutes, {seconds} seconds"
-
-
-def save_estimated_time(injection_id, estimated_time):
-    """Saves the estimated processing time to the database"""
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        
-        # Check if estimated_time column exists
-        cursor.execute("PRAGMA table_info(injections)")
-        columns = [info[1] for info in cursor.fetchall()]
-        
-        if "estimated_time" not in columns:
-            cursor.execute("ALTER TABLE injections ADD COLUMN estimated_time TEXT")
-            print("Added estimated_time column to the injections table")
-        
-        # Update the record with the estimated time
-        cursor.execute(
-            "UPDATE injections SET estimated_time = ? WHERE id = ?",
-            (estimated_time, injection_id)
-        )
-        conn.commit()
-        conn.close()
-        print(f"✅ Saved estimated time '{estimated_time}' for injection ID: {injection_id}")
-        return True
-    except Exception as e:
-        print(f"❌ Error saving estimated time to database: {e}")
-        return False
 
 
 @app.function(
@@ -236,13 +205,9 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         lines = normalize_script_format(script_data)
         print(f"Successfully decoded script with {len(lines)} dialogue lines")
 
-        # Calculate estimated processing time
+        # 50 seconds per line TTS generation estimate
         estimated_time = estimate_processing_time(lines)
         print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
-        
-        # Store the estimated time in the database if we have an injection_id
-        if injection_id:
-            save_estimated_time(injection_id, estimated_time)
         
     except Exception as e:
         print(f"❌ Error decoding serialized script: {e}")
@@ -282,6 +247,8 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     # Update database if injection_id is provided
     if injection_id:
         try:
+            import sqlite3
+            DB_PATH = "/data/injections.db"
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
