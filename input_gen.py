@@ -190,24 +190,11 @@ DB_PATH = "/data/injections.db"  # <-- ensure consistent path
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Calculate a preliminary ETA based on text length
-def estimate_preliminary_eta(text_length):
-    """Provide a rough ETA based on text length"""
-    # Estimate number of dialogue lines from text length
-    estimated_lines = max(10, text_length // 150)  # At least 10 lines, roughly 150 chars per line
-    seconds_per_line = 50  # Your estimated processing time per line
-    total_seconds = estimated_lines * seconds_per_line
-    minutes = total_seconds // 60
-    seconds = total_seconds % 60
-    return f"{minutes} minutes, {seconds} seconds"
-
 # Setup Database
 def setup_database(db_path: str):
     """Initialize SQLite database for tracking injections"""
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
-    
-    # Create the table if it doesn't exist
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS injections (
             id TEXT PRIMARY KEY,
@@ -216,19 +203,9 @@ def setup_database(db_path: str):
             processed_path TEXT,
             status TEXT DEFAULT 'pending',
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            estimated_time TEXT
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    
-    # Check if estimated_time column exists
-    cursor.execute("PRAGMA table_info(injections)")
-    columns = [info[1] for info in cursor.fetchall()]
-    
-    if "estimated_time" not in columns:
-        cursor.execute("ALTER TABLE injections ADD COLUMN estimated_time TEXT")
-        print("Added estimated_time column to the injections table")
-    
     conn.commit()
     return conn
 
@@ -323,45 +300,15 @@ def serve():
             cls="flex w-full"
         )
         
-        # Process button (no spinner initially)
+        # Process button styled with DaisyUI
         process_button = Button(
-            "Process Content",
-            cls="btn btn-primary w-full mt-4",
-            type="submit"
+            "Process Content", 
+            cls="btn btn-primary w-full mt-4"
         )
-        
-        # Add script to handle loading state
-        loading_script = Script("""
-        document.addEventListener('htmx:beforeRequest', function(evt) {
-            if (evt.target.matches('form')) {
-                // Find the submit button
-                var btn = evt.target.querySelector('button[type="submit"]');
-                if (btn) {
-                    // Save the original text
-                    btn.dataset.originalText = btn.textContent;
-                    // Replace with loading spinner
-                    btn.innerHTML = '<span class="loading loading-spinner loading-lg text-secondary"></span>';
-                    btn.disabled = true;
-                }
-            }
-        });
-        document.addEventListener('htmx:afterRequest', function(evt) {
-            if (evt.target.matches('form')) {
-                // Find the submit button
-                var btn = evt.target.querySelector('button[type="submit"]');
-                if (btn && btn.dataset.originalText) {
-                    // Restore original text
-                    btn.innerHTML = btn.dataset.originalText;
-                    btn.disabled = false;
-                }
-            }
-        });
-        """)
         
         upload_form = Form(
             side_by_side,
             process_button,
-            loading_script,
             hx_post="/inject",
             hx_swap="afterbegin",
             enctype="multipart/form-data",
@@ -445,16 +392,12 @@ def serve():
                     id="injection-status"
                 )
 
-            # Calculate a preliminary ETA based on text length
-            preliminary_eta = estimate_preliminary_eta(len(processed_text))
-            print(f"🕒 Preliminary ETA: {preliminary_eta}")
-
-            # Insert record into database with preliminary ETA
+            # Insert record into database
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO injections (id, original_filename, input_type, status, estimated_time) VALUES (?, ?, ?, ?, ?)",
-                (injection_id, original_filename, input_type, "processing", preliminary_eta)
+                "INSERT INTO injections (id, original_filename, input_type, status) VALUES (?, ?, ?, ?)",
+                (injection_id, original_filename, input_type, "processing")
             )
             conn.commit()
             conn.close()
@@ -467,45 +410,28 @@ def serve():
             # Generate the audio
             audio_path = generate_audio.remote(script_pkl_path, injection_id)
             
-            # Create a status area with direct HTML
-            success_notification = Div(
-                P(f"✅ Content processed successfully! Your podcast is being generated."),
-                cls="alert alert-success"
-            )
-            
-            podcast_id_display = Div(
-                P(f"Your podcast ID: ", 
-                  Span(injection_id, cls="font-mono bg-base-300 px-2 py-1 rounded")),
-                cls="mt-2 mb-4"
-            )
-            
-            # Use direct HTML for the ETA alert to ensure it displays correctly
-            eta_alert_html = f"""
-            <div role="alert" class="alert alert-warning my-4">
-                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                </svg>
-                <span>✨ Estimated processing time: {preliminary_eta}</span>
-            </div>
-            """
-            
-            status_check_area = Div(
-                Div(
-                    P("Checking status...", id="status-message"),
-                    cls="animate-pulse"
-                ),
-                # HTMX polling - start immediately and keep checking
-                hx_get=f"/check-status-partial/{injection_id}",
-                hx_trigger="load delay:5s, every 10s",  # Delay the first check to allow ETA to be updated
-                hx_swap="innerHTML",
-                cls="p-4 border rounded-lg mt-4"
-            )
-            
+            # Create a status area that polls for updates using HTMX
             return Div(
-                success_notification,
-                podcast_id_display,
-                NotStr(eta_alert_html),  # Use NotStr to inject direct HTML
-                status_check_area,
+                Div(
+                    P(f"✅ Content processed successfully! Your podcast is being generated."),
+                    cls="alert alert-success"
+                ),
+                Div(
+                    P(f"Your podcast ID: ", 
+                      Span(injection_id, cls="font-mono bg-base-300 px-2 py-1 rounded")),
+                    cls="mt-2 mb-4"
+                ),
+                Div(
+                    Div(
+                        P("Checking status...", id="status-message"),
+                        cls="animate-pulse"
+                    ),
+                    # HTMX polling
+                    hx_get=f"/check-status-partial/{injection_id}",
+                    hx_trigger="load delay:5s, every 10s",
+                    hx_swap="innerHTML",
+                    cls="p-4 border rounded-lg"
+                ),
                 id="injection-status"
             )
 
@@ -520,102 +446,99 @@ def serve():
 
     @rt("/check-status-partial/{injection_id}")
     async def check_status_partial(injection_id: str):
-        """Check status and return HTML partial for the status area with direct HTML"""
+        """Check status and return HTML partial for the status area"""
         import base64
         
         # Check database for completion status
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT processed_path, status, estimated_time FROM injections WHERE id = ?", 
+            "SELECT processed_path, status FROM injections WHERE id = ?", 
             (injection_id,)
         )
         result = cursor.fetchone()
         conn.close()
         
         if not result:
-            return NotStr("""
-            <div class="alert alert-error">
-                <p>No record found for this ID.</p>
-            </div>
-            """)
+            return Div(
+                Div(
+                    P(f"No record found for ID: {injection_id}"),
+                    cls="alert alert-error"
+                )
+            )
         
-        # Extract values safely
-        audio_path = result[0] if len(result) > 0 else None
-        status = result[1] if len(result) > 1 else "unknown"
-        estimated_time = result[2] if len(result) > 2 else None
+        audio_path, status = result
         
-        print(f"Status check for {injection_id}: path={audio_path}, status={status}, eta={estimated_time}")
+        print(f"Status check for {injection_id}: path={audio_path}, status={status}")
         
         # If not completed yet, return status with continued polling
         if status != "completed" or not audio_path:
-            # Build the status content with direct HTML
-            eta_html = ""
-            if estimated_time:
-                print(f"Adding ETA alert for: {estimated_time}")
-                eta_html = f"""
-                <div role="alert" class="alert alert-warning my-4">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                    </svg>
-                    <span>✨ Estimated processing time: {estimated_time}</span>
-                </div>
-                """
-            
-            return NotStr(f"""
-            <div class="alert alert-info">
-                <p>Your podcast is still being generated. Status: {status}</p>
-            </div>
-            {eta_html}
-            <p class="mt-2 text-sm opacity-75">This will update automatically when ready.</p>
-            <script>
-                setTimeout(function() {{
-                    htmx.ajax('GET', '/check-status-partial/{injection_id}', '#injection-status');
-                }}, 10000);
-            </script>
-            """)
+            return Div(
+                Div(
+                    P(f"Your podcast is still being generated. Status: {status}"),
+                    cls="alert alert-info"
+                ),
+                P("This will update automatically when ready.", cls="mt-2 text-sm opacity-75"),
+                # Continue polling
+                hx_get=f"/check-status-partial/{injection_id}",
+                hx_trigger="every 10s",
+                hx_swap="innerHTML"
+            )
         
-        # File is ready - display the audio player with direct HTML
+        # File is ready - display the audio player and stop polling
         if audio_path and os.path.exists(audio_path):
             try:
                 with open(audio_path, "rb") as f:
                     audio_data = f.read()
                     b64_audio = base64.b64encode(audio_data).decode("ascii")
                     
-                return NotStr(f"""
-                <div class="alert alert-success">
-                    <p>🎉 Your Podcast is Ready!</p>
-                </div>
-                <div class="mt-4 p-4 bg-base-200 rounded-lg">
-                    <h2 class="text-lg font-bold mb-2">Listen to your podcast:</h2>
-                    <p class="text-sm opacity-75 mb-2">ID: {injection_id}</p>
-                    <audio src="data:audio/wav;base64,{b64_audio}" controls class="w-full rounded-lg shadow"></audio>
-                </div>
-                """)
+                return Div(
+                    Div(
+                        P("🎉 Your Podcast is Ready!"),
+                        cls="alert alert-success"
+                    ),
+                    Div(
+                        H2("Listen to your podcast:", cls="text-lg font-bold mb-2"),
+                        P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-2"),
+                        Audio(
+                            src=f"data:audio/wav;base64,{b64_audio}",
+                            controls=True,
+                            cls="w-full rounded-lg shadow"
+                        ),
+                        cls="mt-4 p-4 bg-base-200 rounded-lg"
+                    )
+                    # No more hx_trigger => polling stops
+                )
             except Exception as e:
-                return NotStr(f"""
-                <div class="alert alert-error">
-                    <p>Error loading audio file: {str(e)}</p>
-                </div>
-                """)
+                print(f"Error for {injection_id}: {str(e)}")
+                return Div(
+                    Div(
+                        P(f"Error loading audio file: {str(e)}"),
+                        cls="alert alert-error"
+                    )
+                    # Stop polling on error
+                )
         else:
-            return NotStr(f"""
-            <div class="alert alert-error">
-                <p>Audio file not found. Status shows completed but file is missing.</p>
-            </div>
-            <button class="btn btn-sm mt-2" hx-get="/check-status-partial/{injection_id}" hx-swap="innerHTML">Retry</button>
-            """)
+            print(f"File not found at path: {audio_path}")
+            return Div(
+                Div(
+                    P(f"Audio file not found. Status shows completed but file is missing."),
+                    cls="alert alert-error"
+                ),
+                Button("Retry", hx_get=f"/check-status-partial/{injection_id}", 
+                      hx_swap="innerHTML", cls="btn btn-sm mt-2")
+            )
     
     @rt("/status/{injection_id}")
     async def check_status(injection_id: str):
-        """Check status and display audio if ready - using direct HTML approach"""
+        """Check status and display audio if ready"""
         import base64
         
         # Check database for completion status
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT processed_path, status, estimated_time FROM injections WHERE id = ?", 
+            "SELECT processed_path, status FROM injections WHERE id = ?", 
             (injection_id,)
         )
         result = cursor.fetchone()
@@ -633,55 +556,29 @@ def serve():
                 )
             )
         
-        # Extract values safely
-        audio_path = result[0] if len(result) > 0 else None
-        status = result[1] if len(result) > 1 else "unknown"
-        estimated_time = result[2] if len(result) > 2 else None
+        audio_path, status = result
         
         if status != "completed" or not audio_path:
-            # If still processing, use direct HTML for the core content
-            status_content = Div(
-                H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
-                cls="container mx-auto px-4 py-8 max-w-3xl"
-            )
-            
-            # Add the info alert
-            status_content.append(
+            # If still processing, show status with auto-updating div
+            return Title("Podcast Status"), Main(
                 Div(
-                    P(f"Your podcast is still being generated. Status: {status}"),
-                    cls="alert alert-info"
+                    H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
+                    Div(
+                        Div(
+                            P(f"Your podcast is still being generated. Status: {status}"),
+                            cls="alert alert-info"
+                        ),
+                        P("This page will automatically update when ready.", 
+                          cls="mt-2 text-center text-sm opacity-75"),
+                        # Add HTMX polling
+                        hx_get=f"/check-status-partial/{injection_id}",
+                        hx_trigger="load delay:1s, every 10s",
+                        hx_swap="outerHTML",
+                        cls="p-4 border rounded-lg"
+                    ),
+                    cls="container mx-auto px-4 py-8 max-w-3xl"
                 )
             )
-            
-            # Add ETA alert with direct HTML if available
-            if estimated_time:
-                print(f"Adding ETA alert to status page: {estimated_time}")
-                status_content.append(
-                    NotStr(f"""
-                    <div role="alert" class="alert alert-warning mt-4">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 shrink-0 stroke-current" fill="none" viewBox="0 0 24 24">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
-                        </svg>
-                        <span>✨ Estimated processing time: {estimated_time}</span>
-                    </div>
-                    """)
-                )
-            
-            status_content.append(
-                P("This page will automatically update when ready.", 
-                  cls="mt-4 text-center text-sm opacity-75")
-            )
-            
-            # Add HTMX polling div
-            polling_div = Div(
-                hx_get=f"/check-status-partial/{injection_id}",
-                hx_trigger="load delay:2s, every 10s",
-                hx_swap="outerHTML",
-                cls="p-4 border rounded-lg mt-4"
-            )
-            status_content.append(polling_div)
-            
-            return Title("Podcast Status"), Main(status_content)
         
         # File is ready - display the audio player
         if audio_path and os.path.exists(audio_path):
