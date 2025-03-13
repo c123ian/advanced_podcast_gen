@@ -367,7 +367,7 @@ def serve():
             Div(
                 H1("Generate AI Podcast from Content", cls="text-2xl font-bold text-center mb-4"),
                 P("Upload a file or provide a URL to process content for podcast generation.", 
-                cls="text-center mb-6"),
+                  cls="text-center mb-6"),
                 upload_form,
                 Div(id="injection-status", cls="my-4"),
                 Div(
@@ -441,37 +441,9 @@ def serve():
             print("🔊 Kicking off audio generation...")
             generate_audio.spawn(script_data, injection_id)
             
-            # Return a confirmation page with podcast ID and link
-            return Title("Podcast Processing"), Main(
-                Div(
-                    Div(
-                        P("✅ Your podcast is being generated!", cls="text-xl font-bold"),
-                        cls="alert alert-success mb-6"
-                    ),
-                    Div(
-                        H2("Important: Save Your Podcast ID", cls="text-lg font-bold mb-4"),
-                        P("Your unique podcast ID:", cls="mb-2"),
-                        Div(
-                            P(injection_id, cls="font-mono text-lg select-all"),
-                            cls="p-3 bg-base-300 rounded-lg mb-4 text-center"
-                        ),
-                        P("Processing will take approximately 30-60 minutes depending on content length.", 
-                        cls="mb-6 text-center"),
-                        Div(
-                            A(
-                                "Check Podcast Status", 
-                                href=f"/status/{injection_id}",
-                                cls="btn btn-primary btn-lg w-full"
-                            ),
-                            cls="mt-6"
-                        ),
-                        P("Bookmark the status page to easily check back later.", cls="mt-4 text-sm opacity-75 text-center"),
-                        cls="p-6 bg-base-200 rounded-lg"
-                    ),
-                    A("← Generate Another Podcast", href="/", cls="btn btn-ghost mt-8"),
-                    cls="container mx-auto max-w-2xl py-12"
-                )
-            )
+            # Redirect to the generating page instead of returning HTML directly
+            from starlette.responses import RedirectResponse
+            return RedirectResponse(f"/generating/{injection_id}", status_code=303)
 
         except Exception as e:
             return Div(
@@ -482,131 +454,244 @@ def serve():
                 id="injection-status"
             )
 
-    @rt("/status/{injection_id}")
-    async def check_status(injection_id: str):
-        """Check status and display audio if ready"""
-        import base64
+    @rt("/generating/{injection_id}")
+    def generating_podcast(injection_id: str):
+        """Page with animation for generating podcast"""
+        # Add the animation style
+        animation_style = Style("""
+        .animated-bg {
+            background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
+            height: 100vh;
+        }
         
-        # Check database for completion status
+        @keyframes gradient {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        
+        .floating {
+            animation: float 6s ease-in-out infinite;
+            transform-origin: center;
+        }
+        
+        @keyframes float {
+            0% { transform: translateY(0px) rotate(0deg); }
+            50% { transform: translateY(-20px) rotate(5deg); }
+            100% { transform: translateY(0px) rotate(0deg); }
+        }
+        """)
+        
+        # Check the status from database
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT processed_path, status FROM injections WHERE id = ?", 
+            "SELECT status FROM injections WHERE id = ?", 
             (injection_id,)
         )
         result = cursor.fetchone()
         conn.close()
         
-        if not result:
-            return Title("Podcast Status"), Main(
+        status = result[0] if result else "unknown"
+        
+        # Add some pulsing circles for visual interest
+        circle_animation = Div(
+            Div(cls="w-64 h-64 bg-purple-500 rounded-full absolute opacity-10 floating", 
+                style="top: 10%; left: 10%;"),
+            Div(cls="w-48 h-48 bg-blue-500 rounded-full absolute opacity-10 floating", 
+                style="top: 60%; left: 70%;"),
+            Div(cls="w-32 h-32 bg-green-500 rounded-full absolute opacity-10 floating", 
+                style="top: 30%; left: 80%;"),
+            cls="w-full h-full absolute top-0 left-0 overflow-hidden"
+        )
+        
+        return Title("Generating Your Podcast"), Main(
+            animation_style,
+            circle_animation,
+            Div(
                 Div(
-                    H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
+                    H1("Your Podcast is Being Generated", cls="text-3xl font-bold text-center text-white mb-6"),
                     Div(
-                        P(f"No record found for ID: {injection_id}"),
+                        Div(cls="loading loading-dots loading-lg mb-6"),
+                        P(f"Current status: {status}", cls="text-lg mb-4 text-center text-white"),
+                        P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-6 text-center text-white"),
+                        Div(
+                            A(
+                                "Check Status",
+                                href=f"/status/{injection_id}",
+                                cls="btn btn-primary btn-lg"
+                            ),
+                            cls="text-center"
+                        ),
+                        cls="p-8 rounded-lg bg-black bg-opacity-20 backdrop-blur-sm"
+                    ),
+                    A("← Back to Home", href="/", cls="btn btn-ghost mt-8 text-white"),
+                    cls="flex flex-col items-center justify-center min-h-screen"
+                ),
+                cls="container mx-auto px-4 py-16 max-w-3xl relative z-10"
+            ),
+            cls="animated-bg"
+        )
+    
+    @rt("/status/{injection_id}")
+    async def check_status(injection_id: str):
+        """Check status and display audio if ready"""
+        import base64
+        
+        try:
+            # Check database for completion status
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT processed_path, status FROM injections WHERE id = ?", 
+                (injection_id,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if not result:
+                return Title("Podcast Status"), Main(
+                    Div(
+                        H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
+                        Div(
+                            P(f"No record found for ID: {injection_id}"),
+                            cls="alert alert-error"
+                        ),
+                        A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
+                        cls="container mx-auto px-4 py-8 max-w-3xl"
+                    )
+                )
+            
+            audio_path, status = result
+            
+            if status != "completed" or not audio_path:
+                # Simple CSS animation without SVG
+                animation_style = Style("""
+                .pulse-bg {
+                    background: linear-gradient(45deg, #f3ec78, #af4261, #3cdd8c, #5e9df9);
+                    background-size: 400% 400%;
+                    animation: gradient 15s ease infinite;
+                }
+                
+                @keyframes gradient {
+                    0% { background-position: 0% 50%; }
+                    50% { background-position: 100% 50%; }
+                    100% { background-position: 0% 50%; }
+                }
+                """)
+                
+                # Show the "still processing" page with manual refresh
+                return Title("Podcast Status"), Main(
+                    animation_style,
+                    Div(
+                        H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
+                        Div(
+                            P(f"Your podcast is still being generated. Status: {status}", 
+                              cls="mb-4 text-center font-bold"),
+                            P("Processing usually takes 30-60 minutes depending on content length.", 
+                              cls="mb-6 text-center"),
+                            P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-8 text-center"),
+                            Button(
+                                Span("Refresh Status", cls="mr-2"),
+                                Span(cls="loading loading-spinner loading-xs"),
+                                onClick="window.location.reload()",
+                                cls="btn btn-primary block mx-auto"
+                            ),
+                            cls="p-6 bg-base-200 rounded-lg"
+                        ),
+                        A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
+                        cls="container mx-auto px-4 py-8 max-w-3xl"
+                    ),
+                    cls="min-h-screen pulse-bg"
+                )
+            
+            # File is ready - display the audio player
+            if audio_path and os.path.exists(audio_path):
+                try:
+                    with open(audio_path, "rb") as f:
+                        audio_data = f.read()
+                        b64_audio = base64.b64encode(audio_data).decode("ascii")
+                        
+                    return Title("Your Podcast"), Main(
+                        Div(
+                            H1("Your Podcast is Ready!", cls="text-2xl font-bold text-center mb-4"),
+                            Div(
+                                P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-4 text-center"),
+                                Div(
+                                    H2("Listen to Your Podcast", cls="text-lg font-bold mb-3"),
+                                    Audio(
+                                        src=f"data:audio/wav;base64,{b64_audio}",
+                                        controls=True,
+                                        preload="auto",
+                                        cls="w-full rounded-lg shadow mb-4"
+                                    ),
+                                    A(
+                                        "Download Podcast", 
+                                        href=f"data:audio/wav;base64,{b64_audio}",
+                                        download=f"podcast_{injection_id}.wav",
+                                        cls="btn btn-secondary w-full"
+                                    ),
+                                    cls="mb-6"
+                                ),
+                                cls="p-6 bg-base-200 rounded-lg"
+                            ),
+                            A("← Generate Another Podcast", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
+                            cls="container mx-auto px-4 py-8 max-w-3xl"
+                        )
+                    )
+                except Exception as e:
+                    return Title("Error"), Main(
+                        Div(
+                            H1("Error", cls="text-2xl font-bold text-center mb-4 text-error"),
+                            Div(
+                                P(f"Error loading audio file: {str(e)}"),
+                                cls="alert alert-error"
+                            ),
+                            Button(
+                                "Try Again", 
+                                onClick="window.location.reload()",
+                                cls="btn btn-primary mt-4 block mx-auto"
+                            ),
+                            A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
+                            cls="container mx-auto px-4 py-8 max-w-3xl"
+                        )
+                    )
+            else:
+                return Title("File Not Found"), Main(
+                    Div(
+                        H1("File Not Found", cls="text-2xl font-bold text-center mb-4 text-error"),
+                        Div(
+                            P(f"Audio file not found at expected location.", cls="mb-2"),
+                            P("The file may have been removed or there was an error in processing.", 
+                              cls="text-sm opacity-75"),
+                            cls="alert alert-error mb-6"
+                        ),
+                        Button(
+                            "Retry", 
+                            onClick="window.location.reload()",
+                            cls="btn btn-primary block mx-auto"
+                        ),
+                        A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
+                        cls="container mx-auto px-4 py-8 max-w-3xl text-center"
+                    )
+                )
+        except Exception as e:
+            # Add detailed error handling to debug the 500 error
+            print(f"Error in status page: {str(e)}")
+            return Title("Error"), Main(
+                Div(
+                    H1("Error", cls="text-2xl font-bold text-center mb-4 text-error"),
+                    Div(
+                        P(f"An error occurred: {str(e)}"),
                         cls="alert alert-error"
                     ),
                     A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                     cls="container mx-auto px-4 py-8 max-w-3xl"
                 )
             )
-        
-        audio_path, status = result
-        
-        if status != "completed" or not audio_path:
-            # Show the "still processing" page with manual refresh
-            return Title("Podcast Status"), Main(
-                Div(
-                    H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
-                    Div(
-                        P(f"Your podcast is still being generated. Status: {status}", 
-                        cls="mb-4 text-center font-bold"),
-                        P("Processing usually takes 30-60 minutes depending on content length.", 
-                        cls="mb-6 text-center"),
-                        P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-8 text-center"),
-                        Button(
-                            Span("Refresh Status", cls="mr-2"),
-                            Span(cls="loading loading-spinner loading-xs"),
-                            onClick="window.location.reload()",
-                            cls="btn btn-primary block mx-auto"
-                        ),
-                        cls="p-6 bg-base-200 rounded-lg"
-                    ),
-                    A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
-                    cls="container mx-auto px-4 py-8 max-w-3xl"
-                )
-            )
-        
-        # File is ready - display the audio player
-        if audio_path and os.path.exists(audio_path):
-            try:
-                with open(audio_path, "rb") as f:
-                    audio_data = f.read()
-                    b64_audio = base64.b64encode(audio_data).decode("ascii")
-                    
-                return Title("Your Podcast"), Main(
-                    Div(
-                        H1("Your Podcast is Ready!", cls="text-2xl font-bold text-center mb-4"),
-                        Div(
-                            P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-4 text-center"),
-                            Div(
-                                H2("Listen to Your Podcast", cls="text-lg font-bold mb-3"),
-                                Audio(
-                                    src=f"data:audio/wav;base64,{b64_audio}",
-                                    controls=True,
-                                    preload="auto",
-                                    cls="w-full rounded-lg shadow mb-4"
-                                ),
-                                A(
-                                    "Download Podcast", 
-                                    href=f"data:audio/wav;base64,{b64_audio}",
-                                    download=f"podcast_{injection_id}.wav",
-                                    cls="btn btn-secondary w-full"
-                                ),
-                                cls="mb-6"
-                            ),
-                            cls="p-6 bg-base-200 rounded-lg"
-                        ),
-                        A("← Generate Another Podcast", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
-                        cls="container mx-auto px-4 py-8 max-w-3xl"
-                    )
-                )
-            except Exception as e:
-                return Title("Error"), Main(
-                    Div(
-                        H1("Error", cls="text-2xl font-bold text-center mb-4 text-error"),
-                        Div(
-                            P(f"Error loading audio file: {str(e)}"),
-                            cls="alert alert-error"
-                        ),
-                        Button(
-                            "Try Again", 
-                            onClick="window.location.reload()",
-                            cls="btn btn-primary mt-4 block mx-auto"
-                        ),
-                        A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
-                        cls="container mx-auto px-4 py-8 max-w-3xl"
-                    )
-                )
-        else:
-            return Title("File Not Found"), Main(
-                Div(
-                    H1("File Not Found", cls="text-2xl font-bold text-center mb-4 text-error"),
-                    Div(
-                        P(f"Audio file not found at expected location.", cls="mb-2"),
-                        P("The file may have been removed or there was an error in processing.", 
-                        cls="text-sm opacity-75"),
-                        cls="alert alert-error mb-6"
-                    ),
-                    Button(
-                        "Retry", 
-                        onClick="window.location.reload()",
-                        cls="btn btn-primary block mx-auto"
-                    ),
-                    A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
-                    cls="container mx-auto px-4 py-8 max-w-3xl text-center"
-                )
-            )
-
+    
     @rt("/status-redirect")
     def status_redirect(injection_id: str):
         """Redirect to the status page for an ID"""
