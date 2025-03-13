@@ -300,15 +300,45 @@ def serve():
             cls="flex w-full"
         )
         
-        # Process button styled with DaisyUI
+        # Process button (no spinner initially)
         process_button = Button(
-            "Process Content", 
-            cls="btn btn-primary w-full mt-4"
+            "Process Content",
+            cls="btn btn-primary w-full mt-4",
+            type="submit"
         )
-        
+
+        # Add script to handle loading state
+        loading_script = Script("""
+        document.addEventListener('htmx:beforeRequest', function(evt) {
+            if (evt.target.matches('form')) {
+                // Find the submit button
+                var btn = evt.target.querySelector('button[type="submit"]');
+                if (btn) {
+                    // Save the original text
+                    btn.dataset.originalText = btn.textContent;
+                    // Replace with loading spinner
+                    btn.innerHTML = '<span class="loading loading-spinner loading-lg text-secondary"></span>';
+                    btn.disabled = true;
+                }
+            }
+        });
+        document.addEventListener('htmx:afterRequest', function(evt) {
+            if (evt.target.matches('form')) {
+                // Find the submit button
+                var btn = evt.target.querySelector('button[type="submit"]');
+                if (btn && btn.dataset.originalText) {
+                    // Restore original text
+                    btn.innerHTML = btn.dataset.originalText;
+                    btn.disabled = false;
+                }
+            }
+        });
+        """)
+
         upload_form = Form(
             side_by_side,
             process_button,
+            loading_script,
             hx_post="/inject",
             hx_swap="afterbegin",
             enctype="multipart/form-data",
@@ -337,7 +367,7 @@ def serve():
             Div(
                 H1("Generate AI Podcast from Content", cls="text-2xl font-bold text-center mb-4"),
                 P("Upload a file or provide a URL to process content for podcast generation.", 
-                  cls="text-center mb-6"),
+                cls="text-center mb-6"),
                 upload_form,
                 Div(id="injection-status", cls="my-4"),
                 Div(
@@ -402,37 +432,45 @@ def serve():
             conn.commit()
             conn.close()
 
-            # Call the Modal functions using `.remote(...)`
+            # Proper function sequence with correctly coupled inputs/outputs
             print("🚀 Kicking off script generation...")
-            script_pkl_path = generate_script.remote(processed_text)
-
-            print("🔊 Kicking off audio generation...")
-            # Generate the audio
-            audio_path = generate_audio.remote(script_pkl_path, injection_id)
+            # First run script generation and get the result
+            script_data = generate_script.remote(processed_text)
             
-            # Create a status area that polls for updates using HTMX
-            return Div(
-                Div(
-                    P(f"✅ Content processed successfully! Your podcast is being generated."),
-                    cls="alert alert-success"
-                ),
-                Div(
-                    P(f"Your podcast ID: ", 
-                      Span(injection_id, cls="font-mono bg-base-300 px-2 py-1 rounded")),
-                    cls="mt-2 mb-4"
-                ),
+            # Then pass that directly to audio generation
+            print("🔊 Kicking off audio generation...")
+            generate_audio.spawn(script_data, injection_id)
+            
+            # Return a confirmation page with podcast ID and link
+            return Title("Podcast Processing"), Main(
                 Div(
                     Div(
-                        P("Checking status...", id="status-message"),
-                        cls="animate-pulse"
+                        P("✅ Your podcast is being generated!", cls="text-xl font-bold"),
+                        cls="alert alert-success mb-6"
                     ),
-                    # HTMX polling
-                    hx_get=f"/check-status-partial/{injection_id}",
-                    hx_trigger="load delay:5s, every 10s",
-                    hx_swap="innerHTML",
-                    cls="p-4 border rounded-lg"
-                ),
-                id="injection-status"
+                    Div(
+                        H2("Important: Save Your Podcast ID", cls="text-lg font-bold mb-4"),
+                        P("Your unique podcast ID:", cls="mb-2"),
+                        Div(
+                            P(injection_id, cls="font-mono text-lg select-all"),
+                            cls="p-3 bg-base-300 rounded-lg mb-4 text-center"
+                        ),
+                        P("Processing will take approximately 30-60 minutes depending on content length.", 
+                        cls="mb-6 text-center"),
+                        Div(
+                            A(
+                                "Check Podcast Status", 
+                                href=f"/status/{injection_id}",
+                                cls="btn btn-primary btn-lg w-full"
+                            ),
+                            cls="mt-6"
+                        ),
+                        P("Bookmark the status page to easily check back later.", cls="mt-4 text-sm opacity-75 text-center"),
+                        cls="p-6 bg-base-200 rounded-lg"
+                    ),
+                    A("← Generate Another Podcast", href="/", cls="btn btn-ghost mt-8"),
+                    cls="container mx-auto max-w-2xl py-12"
+                )
             )
 
         except Exception as e:
@@ -444,91 +482,6 @@ def serve():
                 id="injection-status"
             )
 
-    @rt("/check-status-partial/{injection_id}")
-    async def check_status_partial(injection_id: str):
-        """Check status and return HTML partial for the status area"""
-        import base64
-        
-        # Check database for completion status
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT processed_path, status FROM injections WHERE id = ?", 
-            (injection_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            return Div(
-                Div(
-                    P(f"No record found for ID: {injection_id}"),
-                    cls="alert alert-error"
-                )
-            )
-        
-        audio_path, status = result
-        
-        print(f"Status check for {injection_id}: path={audio_path}, status={status}")
-        
-        # If not completed yet, return status with continued polling
-        if status != "completed" or not audio_path:
-            return Div(
-                Div(
-                    P(f"Your podcast is still being generated. Status: {status}"),
-                    cls="alert alert-info"
-                ),
-                P("This will update automatically when ready.", cls="mt-2 text-sm opacity-75"),
-                # Continue polling
-                hx_get=f"/check-status-partial/{injection_id}",
-                hx_trigger="every 10s",
-                hx_swap="innerHTML"
-            )
-        
-        # File is ready - display the audio player and stop polling
-        if audio_path and os.path.exists(audio_path):
-            try:
-                with open(audio_path, "rb") as f:
-                    audio_data = f.read()
-                    b64_audio = base64.b64encode(audio_data).decode("ascii")
-                    
-                return Div(
-                    Div(
-                        P("🎉 Your Podcast is Ready!"),
-                        cls="alert alert-success"
-                    ),
-                    Div(
-                        H2("Listen to your podcast:", cls="text-lg font-bold mb-2"),
-                        P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-2"),
-                        Audio(
-                            src=f"data:audio/wav;base64,{b64_audio}",
-                            controls=True,
-                            cls="w-full rounded-lg shadow"
-                        ),
-                        cls="mt-4 p-4 bg-base-200 rounded-lg"
-                    )
-                    # No more hx_trigger => polling stops
-                )
-            except Exception as e:
-                print(f"Error for {injection_id}: {str(e)}")
-                return Div(
-                    Div(
-                        P(f"Error loading audio file: {str(e)}"),
-                        cls="alert alert-error"
-                    )
-                    # Stop polling on error
-                )
-        else:
-            print(f"File not found at path: {audio_path}")
-            return Div(
-                Div(
-                    P(f"Audio file not found. Status shows completed but file is missing."),
-                    cls="alert alert-error"
-                ),
-                Button("Retry", hx_get=f"/check-status-partial/{injection_id}", 
-                      hx_swap="innerHTML", cls="btn btn-sm mt-2")
-            )
-    
     @rt("/status/{injection_id}")
     async def check_status(injection_id: str):
         """Check status and display audio if ready"""
@@ -552,6 +505,7 @@ def serve():
                         P(f"No record found for ID: {injection_id}"),
                         cls="alert alert-error"
                     ),
+                    A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                     cls="container mx-auto px-4 py-8 max-w-3xl"
                 )
             )
@@ -559,23 +513,25 @@ def serve():
         audio_path, status = result
         
         if status != "completed" or not audio_path:
-            # If still processing, show status with auto-updating div
+            # Show the "still processing" page with manual refresh
             return Title("Podcast Status"), Main(
                 Div(
                     H1("Podcast Status", cls="text-2xl font-bold text-center mb-4"),
                     Div(
-                        Div(
-                            P(f"Your podcast is still being generated. Status: {status}"),
-                            cls="alert alert-info"
+                        P(f"Your podcast is still being generated. Status: {status}", 
+                        cls="mb-4 text-center font-bold"),
+                        P("Processing usually takes 30-60 minutes depending on content length.", 
+                        cls="mb-6 text-center"),
+                        P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-8 text-center"),
+                        Button(
+                            Span("Refresh Status", cls="mr-2"),
+                            Span(cls="loading loading-spinner loading-xs"),
+                            onClick="window.location.reload()",
+                            cls="btn btn-primary block mx-auto"
                         ),
-                        P("This page will automatically update when ready.", 
-                          cls="mt-2 text-center text-sm opacity-75"),
-                        # Add HTMX polling
-                        hx_get=f"/check-status-partial/{injection_id}",
-                        hx_trigger="load delay:1s, every 10s",
-                        hx_swap="outerHTML",
-                        cls="p-4 border rounded-lg"
+                        cls="p-6 bg-base-200 rounded-lg"
                     ),
+                    A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                     cls="container mx-auto px-4 py-8 max-w-3xl"
                 )
             )
@@ -591,14 +547,26 @@ def serve():
                     Div(
                         H1("Your Podcast is Ready!", cls="text-2xl font-bold text-center mb-4"),
                         Div(
-                            P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-2"),
-                            Audio(
-                                src=f"data:audio/wav;base64,{b64_audio}",
-                                controls=True,
-                                cls="w-full rounded-lg shadow"
+                            P(f"ID: {injection_id}", cls="text-sm opacity-75 mb-4 text-center"),
+                            Div(
+                                H2("Listen to Your Podcast", cls="text-lg font-bold mb-3"),
+                                Audio(
+                                    src=f"data:audio/wav;base64,{b64_audio}",
+                                    controls=True,
+                                    preload="auto",
+                                    cls="w-full rounded-lg shadow mb-4"
+                                ),
+                                A(
+                                    "Download Podcast", 
+                                    href=f"data:audio/wav;base64,{b64_audio}",
+                                    download=f"podcast_{injection_id}.wav",
+                                    cls="btn btn-secondary w-full"
+                                ),
+                                cls="mb-6"
                             ),
                             cls="p-6 bg-base-200 rounded-lg"
                         ),
+                        A("← Generate Another Podcast", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                         cls="container mx-auto px-4 py-8 max-w-3xl"
                     )
                 )
@@ -610,6 +578,12 @@ def serve():
                             P(f"Error loading audio file: {str(e)}"),
                             cls="alert alert-error"
                         ),
+                        Button(
+                            "Try Again", 
+                            onClick="window.location.reload()",
+                            cls="btn btn-primary mt-4 block mx-auto"
+                        ),
+                        A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                         cls="container mx-auto px-4 py-8 max-w-3xl"
                     )
                 )
@@ -618,10 +592,17 @@ def serve():
                 Div(
                     H1("File Not Found", cls="text-2xl font-bold text-center mb-4 text-error"),
                     Div(
-                        P(f"Audio file not found at expected location: {audio_path}"),
-                        cls="alert alert-error mb-4"
+                        P(f"Audio file not found at expected location.", cls="mb-2"),
+                        P("The file may have been removed or there was an error in processing.", 
+                        cls="text-sm opacity-75"),
+                        cls="alert alert-error mb-6"
                     ),
-                    Button("Retry", hx_get=f"/status/{injection_id}", cls="btn btn-primary"),
+                    Button(
+                        "Retry", 
+                        onClick="window.location.reload()",
+                        cls="btn btn-primary block mx-auto"
+                    ),
+                    A("← Back to Home", href="/", cls="btn btn-ghost mt-6 block mx-auto"),
                     cls="container mx-auto px-4 py-8 max-w-3xl text-center"
                 )
             )
