@@ -92,7 +92,7 @@ def estimate_processing_time(lines):
 def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     """
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
-    """
+    """    
     print(f"🔊 Bark TTS starting. Received encoded script of size: {len(encoded_script)} bytes")
     preload_models()  # Ensure Bark model is loaded
 
@@ -263,6 +263,23 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
 
     # Explicitly commit volume changes so other containers can access it
     shared_volume.commit()
+
+    # At the end of the function, make sure the database is updated:
+    if injection_id:
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections.db"
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE injections SET processed_path = ?, status = 'completed' WHERE id = ?",
+                (final_audio_path, injection_id)
+            )
+            conn.commit()
+            conn.close()
+            print(f"✅ Database updated for injection ID: {injection_id} - Status: completed")
+        except Exception as e:
+            print(f"⚠️ Error updating database: {e}")
     
     # Clean up voice state data after successful completion
     if injection_id:
