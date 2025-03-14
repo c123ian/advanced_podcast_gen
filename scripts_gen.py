@@ -9,6 +9,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 from accelerate import Accelerator
 from common_image import common_image, shared_volume
 import re
+import nltk
+import textwrap
+
+# Import sumy for dedicated summarization
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lex_rank import LexRankSummarizer
 
 # Define app
 app = modal.App("scripts_gen")
@@ -17,6 +24,10 @@ app = modal.App("scripts_gen")
 DATA_DIR = "/data"
 SCRIPTS_FOLDER = "/data/podcast_scripts"
 device = "cuda" if torch.cuda.is_available() else "cpu"
+MAX_INPUT_CHARS = 75000  # Consistent with input_gen.py
+SUMMARIZATION_THRESHOLD = 30000  # Only summarize texts longer than this
+TARGET_SUMMARY_LENGTH = 25000  # Target length for summarized content
+MAX_SCRIPT_EXCHANGES = 35  # Maximum number of exchanges in a script
 
 # Create necessary directories
 os.makedirs(SCRIPTS_FOLDER, exist_ok=True)
@@ -28,17 +39,27 @@ Your job is to write a lively, engaging script with two speakers based on the te
 Speaker 1 leads the conversation, teaching Speaker 2, giving anecdotes and analogies.
 Speaker 2 asks follow-up questions, gets excited or confused, and interrupts with umm, hmm occasionally.
 
+IMPORTANT LENGTH CONSTRAINTS:
+- Create a podcast script with EXACTLY 12-15 exchanges between speakers.
+- The entire podcast should be about 5-7 minutes when read aloud.
+- Keep the conversation focused and concise while maintaining engagement.
+- If the source text is very long, focus on the most important and interesting aspects.
+
 ALWAYS START YOUR RESPONSE WITH 'SPEAKER 1' and a colon.
 PLEASE DO NOT GIVE OR MENTION THE SPEAKERS BY NAME.
 Keep the conversation extremely engaging, welcome the audience with a fun overview, etc.
 Only create ONE EPISODE of the podcast. 
-The speakers discussing a the topic as external commentators.
+The speakers discussing the topic as external commentators.
 """
 
 REWRITE_PROMPT = """
 You are an Oscar-winning screenwriter rewriting a transcript for an AI Text-To-Speech Pipeline.
 
 Make it as engaging as possible, Speaker 1 and 2 will be using different voices.
+
+IMPORTANT LENGTH CONSTRAINTS:
+- The final script should be EXACTLY 12-15 exchanges between speakers.
+- The entire podcast should be about 5-7 minutes when read aloud.
 
 It should be a real podcast with every fine nuance documented in as much detail as possible. Welcome the listeners with a super fun overview and keep it really catchy and almost borderline click bait
 
@@ -109,6 +130,29 @@ def convert_disfluencies(text):
         text = re.sub(r'\(([^)]*' + disfluency + r'[^)]*)\)', r'[\1]', text, flags=re.IGNORECASE)
         
     return text
+
+def summarize_long_text(text, max_length=TARGET_SUMMARY_LENGTH):
+    """Use dedicated summarization library instead of LLM for summarization"""
+    if len(text) <= max_length:
+        return text
+        
+    print(f"📝 Summarizing long text ({len(text)} chars) with sumy...")
+    
+    # Use the LexRank algorithm for extractive summarization (keeps original sentences)
+    parser = PlaintextParser.from_string(text, Tokenizer("english"))
+    
+    # Calculate how many sentences we need (~100 chars per sentence on average)
+    target_sentences = max_length // 100
+    
+    # Create summarizer and extract the most important sentences
+    summarizer = LexRankSummarizer()
+    summary_sentences = summarizer(parser.document, target_sentences)
+    
+    # Join the sentences into a coherent text
+    result = " ".join(str(sentence) for sentence in summary_sentences)
+    print(f"✅ Generated summary of {len(result)} chars with {len(summary_sentences)} sentences")
+    
+    return result
 
 def parse_podcast_script(text: str) -> List[Tuple[str, str]]:
     """Parse the generated text into a list of speaker-text tuples"""
@@ -204,6 +248,29 @@ def normalize_script_quotes(script):
     
     return normalized_script
 
+# Additional helper function
+def truncate_script(script_data, max_exchanges=MAX_SCRIPT_EXCHANGES):
+    """Ensure script doesn't exceed maximum number of exchanges"""
+    if len(script_data) <= max_exchanges:
+        return script_data
+        
+    print(f"⚠️ Script exceeds maximum exchanges ({len(script_data)} > {max_exchanges}), truncating...")
+    
+    # Ensure we have an even number of exchanges and a clean ending
+    end_idx = max_exchanges
+    if max_exchanges % 2 == 1:  # If odd number, make it even
+        end_idx = max_exchanges - 1
+    
+    # Make sure the last exchange is from Speaker 2 for a natural ending
+    if end_idx >= 2:
+        speaker_last = script_data[end_idx-1][0]
+        speaker_second_last = script_data[end_idx-2][0]
+        
+        if speaker_last == speaker_second_last:
+            end_idx = end_idx - 1
+    
+    return script_data[:end_idx]
+
 # Load Llama8B specific image
 llama_image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -212,7 +279,9 @@ llama_image = (
         "transformers==4.46.1",
         "accelerate>=0.26.0",
         "torch>=2.0.0",
-        "sentencepiece"
+        "sentencepiece",
+        "sumy>=0.11.0",  # Add sumy for summarization
+        "nltk>=3.8.1"    # Required by sumy
     )
 )
 
@@ -236,10 +305,23 @@ except modal.exception.NotFoundError:
 )
 def generate_script(source_text: str) -> str:
     """
-    Generates a podcast script from source text.
+    Generates a podcast script from source text with dedicated summarization
+    but preserving the two-step generation process.
     Returns the base64 encoded pickled script (list of tuples).
     """
     print(f"🚀 Generating script from text of length: {len(source_text)} characters")
+    
+    # Step 1: Use dedicated summarization for very long texts
+    if len(source_text) > SUMMARIZATION_THRESHOLD:
+        try:
+            # Download NLTK data if needed (required by sumy)
+            nltk.download('punkt')
+            source_text = summarize_long_text(source_text)
+        except Exception as e:
+            print(f"⚠️ Error during summarization: {e}. Using basic truncation instead.")
+            # Fallback to simple truncation if summarization fails
+            source_text = source_text[:TARGET_SUMMARY_LENGTH]
+            print(f"Truncated text to {len(source_text)} characters")
     
     if LLAMA_DIR:
         # Use local Llama model
@@ -262,18 +344,26 @@ def generate_script(source_text: str) -> str:
             tokenizer=tokenizer,
             device_map="auto",
             max_new_tokens=1500,
-            temperature=1.0,
+            temperature=0.7,      # Slightly lower temperature for more focused output
         )
 
-        # Generate initial script
+        # Step 2: Generate initial script with first prompt
         print("Generating initial script...")
         prompt_1 = SYSTEM_PROMPT + "\n\n" + source_text
         first_draft = generation_pipe(prompt_1)[0]["generated_text"]
 
-        # Rewrite with disfluencies
+        # Step 3: Rewrite with disfluencies using second prompt
         print("Adding natural speech patterns...")
         prompt_2 = REWRITE_PROMPT + "\n\n" + first_draft
         final_text = generation_pipe(prompt_2)[0]["generated_text"]
+        
+        # Step 4: Parse and normalize the script
+        script_data = parse_podcast_script(final_text)
+        
+        print(f"Raw script has {len(script_data)} exchanges")
+        
+        # Step 5: Ensure script doesn't exceed maximum length
+        script_data = truncate_script(script_data)
 
     else:
         # Add OpenAI fallback here if needed
@@ -287,21 +377,19 @@ def generate_script(source_text: str) -> str:
             ("Speaker 2", "Tell me more about that!")
         ]
         """
+        script_data = parse_podcast_script(final_text)
 
-    # Parse into structured format
-    final_script = parse_podcast_script(final_text)
+    # Step 6: Normalize quotes and disfluencies
+    final_script = normalize_script_quotes(script_data)
 
-    # Normalize quotes and disfluencies
-    final_script = normalize_script_quotes(final_script)
-
-    # In generate_script function, right before saving the script:
-    # Check final script format
+    # Step 7: Final format validation
     for i, (speaker, text) in enumerate(final_script):
         # Final validation of format
         if not (speaker == "Speaker 1" or speaker == "Speaker 2"):
             final_script[i] = (f"Speaker {1 if '1' in speaker else 2}", text)
 
-    print(f"Final script format sample: {final_script[0]}")
+    print(f"Final script format sample: {final_script[0] if final_script else '(empty)'}")
+    print(f"Final script length: {len(final_script)} exchanges")
             
     # Save the script to a file for debugging/reference
     import uuid
