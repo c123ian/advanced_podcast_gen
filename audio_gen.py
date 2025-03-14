@@ -6,6 +6,7 @@ from bark import SAMPLE_RATE, preload_models
 from bark.generation import generate_text_semantic
 from bark.api import semantic_to_waveform
 from tqdm import tqdm
+from typing import List, Tuple
 
 # Import shared resources
 from common_image import common_image, shared_volume
@@ -81,19 +82,42 @@ def estimate_processing_time(lines):
     return f"{minutes} minutes, {seconds} seconds"
 
 
+def convert_disfluencies(text):
+    """
+    Convert parenthesized expressions like (laughs) to bracketed [laughs]
+    for proper TTS rendering.
+    """
+    # List of common disfluencies to check for
+    disfluencies = [
+        "laughs", "sighs", "laughter", "gasps", "clears throat", 
+        "sigh", "laugh", "gasp", "chuckles", "snorts",
+        "hmm", "umm", "uh", "ah", "er", "um"
+    ]
+    
+    # Convert (laughs) to [laughs]
+    for disfluency in disfluencies:
+        # Look for various formats and convert them
+        text = re.sub(r'\((' + disfluency + r')\)', r'[\1]', text, flags=re.IGNORECASE)
+        text = re.sub(r'<(' + disfluency + r')>', r'[\1]', text, flags=re.IGNORECASE)
+        
+        # Also match when there's text inside
+        text = re.sub(r'\(([^)]*' + disfluency + r'[^)]*)\)', r'[\1]', text, flags=re.IGNORECASE)
+        
+    return text
+
+
+# Function to process a specific speaker's lines in parallel
 @app.function(
     image=common_image,
-    gpu=modal.gpu.A100(count=1, size="80GB"),
-    container_idle_timeout=10*60,
+    gpu=modal.gpu.A10G(count=1),
     timeout=24*60*60,
     volumes={"/data": shared_volume},
-    allow_concurrent_inputs=100,
 )
-def generate_audio(encoded_script: str, injection_id: str = None) -> str:
-    """
-    Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
-    """    
-    print(f"🔊 Bark TTS starting. Received encoded script of size: {len(encoded_script)} bytes")
+def generate_speaker_audio(speaker_lines: List[Tuple[int, str]], 
+                          speaker: str, 
+                          injection_id: str = None) -> List[Tuple[int, np.ndarray, int]]:
+    """Generate audio for all lines from a single speaker"""
+    print(f"🎙️ Starting audio generation for {speaker} with {len(speaker_lines)} lines")
     preload_models()  # Ensure Bark model is loaded
 
     def sentence_splitter(text):
@@ -104,6 +128,88 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         text = re.sub(r"\s+", " ", text)
         return re.sub(r"[^\w\s.,!?-]", "", text)
 
+    # Speaker voice presets
+    speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
+    default_preset = "v2/en_speaker_9"
+    
+    # Get voice preset for this speaker
+    voice_preset = speaker_voice_mapping.get(speaker, default_preset)
+    
+    # Setup voice consistency with RNG seed
+    voice_state_key = f"{injection_id}_{speaker}" if injection_id else None
+    
+    if voice_state_key and voice_states.contains(voice_state_key):
+        seed = voice_states.get(voice_state_key)
+        print(f"Using saved seed {seed} for {speaker}")
+    else:
+        speaker_num = 1 if speaker == "Speaker 1" else 2
+        seed = np.random.randint(10000 * speaker_num, 10000 * (speaker_num + 1) - 1)
+        if voice_state_key:
+            voice_states[voice_state_key] = seed
+        print(f"Created new seed {seed} for {speaker}")
+    
+    # Set seed for consistent voice
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    # Generation parameters
+    text_temp = 0.6
+    waveform_temp = 0.6
+    
+    # Process each line for this speaker
+    results = []
+    for line_idx, text in tqdm(speaker_lines, desc=f"Generating {speaker} audio"):
+        # Process disfluencies in the text
+        text = convert_disfluencies(text)
+        sentences = sentence_splitter(preprocess_text(text))
+        all_audio = []
+        chunk_silence = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
+        
+        for i, sent in enumerate(sentences):
+            semantic_tokens = generate_text_semantic(
+                sent,
+                history_prompt=voice_preset,
+                temp=text_temp,
+                min_eos_p=0.05,
+            )
+            
+            audio_array = semantic_to_waveform(
+                semantic_tokens, 
+                history_prompt=voice_preset,
+                temp=waveform_temp,
+            )
+            
+            all_audio.append(audio_array)
+            if i < len(sentences) - 1:  # Don't add silence after the last sentence
+                all_audio.append(chunk_silence)
+        
+        if not all_audio:
+            line_audio = np.zeros(24000, dtype=np.float32)
+        else:
+            line_audio = np.concatenate(all_audio, axis=0)
+        
+        # Store with original index for reassembly
+        results.append((line_idx, line_audio, SAMPLE_RATE))
+        print(f"Completed line {line_idx} for {speaker}")
+    
+    print(f"✅ Completed all {len(speaker_lines)} lines for {speaker}")
+    return results
+
+
+@app.function(
+    image=common_image,
+    # No GPU needed for the coordinator
+    container_idle_timeout=10*60,
+    timeout=24*60*60,
+    volumes={"/data": shared_volume},
+    allow_concurrent_inputs=100,
+)
+def generate_audio(encoded_script: str, injection_id: str = None) -> str:
+    """
+    Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
+    """    
+    print(f"🔊 Bark TTS starting with parallel processing. Received encoded script of size: {len(encoded_script)} bytes")
+
     def numpy_to_audio_segment(audio_arr, sr):
         """Converts numpy audio array to an AudioSegment"""
         audio_int16 = (audio_arr * 32767).astype(np.int16)
@@ -111,75 +217,6 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         wavfile.write(bio, sr, audio_int16)
         bio.seek(0)
         return AudioSegment.from_wav(bio)
-
-    # Speaker voice presets
-    speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
-    default_preset = "v2/en_speaker_9"
-
-    def generate_speaker_audio_lowlevel(full_text, speaker):
-        """Generates TTS audio for a given speaker and text using low-level Bark API"""
-        if isinstance(full_text, list):
-            # Check if the list contains dictionaries and extract the text
-            if all(isinstance(item, dict) for item in full_text):
-                full_text = " ".join(item.get('text', '') for item in full_text)
-            else:
-                full_text = " ".join(str(item) for item in full_text)
-
-        voice_preset = speaker_voice_mapping.get(speaker, default_preset)
-        sentences = sentence_splitter(preprocess_text(full_text))
-        all_audio = []
-        # Shorter silence between sentences
-        chunk_silence = np.zeros(int(0.1 * SAMPLE_RATE), dtype=np.float32)
-        
-        # Get voice seed for consistency across distributed containers
-        voice_state_key = f"{injection_id}_{speaker}" if injection_id else None
-        
-        # Here's where we handle voice consistency - using RNG seeds
-        if voice_state_key and voice_states.contains(voice_state_key):
-            # Get the stored RNG seed
-            seed = voice_states.get(voice_state_key)
-            print(f"Using saved seed {seed} for {speaker}")
-        else:
-            # Create a new one - we use speaker name to help with consistency
-            speaker_num = 1 if speaker == "Speaker 1" else 2
-            seed = np.random.randint(10000 * speaker_num, 10000 * (speaker_num + 1) - 1)
-            if voice_state_key:
-                voice_states[voice_state_key] = seed
-            print(f"Created new seed {seed} for {speaker}")
-        
-        # Set a fixed RNG seed for this speaker to maintain voice consistency
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        
-        # Generation parameters - lower temps = more consistent voice
-        text_temp = 0.6
-        waveform_temp = 0.6
-        
-        print(f"Processing {len(sentences)} sentences for {speaker} with voice {voice_preset}")
-        
-        for i, sent in enumerate(sentences):
-            # This is the direct low-level API approach
-            semantic_tokens = generate_text_semantic(
-                sent,
-                history_prompt=voice_preset,  # Always use the base voice preset
-                temp=text_temp,
-                min_eos_p=0.05,  # Lower threshold to prevent hallucinations
-            )
-            
-            audio_array = semantic_to_waveform(
-                semantic_tokens, 
-                history_prompt=voice_preset,  # Always use the base voice preset
-                temp=waveform_temp,
-            )
-            
-            all_audio.append(audio_array)
-            if i < len(sentences) - 1:  # Don't add silence after the last sentence
-                all_audio.append(chunk_silence)
-
-        if not all_audio:
-            return np.zeros(24000, dtype=np.float32), SAMPLE_RATE
-
-        return np.concatenate(all_audio, axis=0), SAMPLE_RATE
 
     def concatenate_audio_segments(segments, rates):
         """Concatenates multiple audio segments"""
@@ -220,20 +257,89 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         ]
         print("Using fallback script instead")
 
-    # --- Step 2: Generate audio ---
-    segments, rates = [], []
-    # Add longer silence between different speakers (0.5 seconds like in notebook, or .25 of a sec)
-    turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)
+    # --- SPEAKER SEPARATION FOR PARALLEL PROCESSING ---
+    # Original script format is a list of tuples like:
+    # [
+    #   ("Speaker 1", "Welcome to our podcast..."),  # index 0
+    #   ("Speaker 2", "Thanks for having me..."),    # index 1
+    #   ("Speaker 1", "Today we're discussing..."),  # index 2
+    #   ...
+    # ]
+
+    # Print the first few lines to verify input format
+    print("DEBUG - Original script format:")
+    for i, (speaker, text) in enumerate(lines[:min(3, len(lines))]):
+        print(f"  Line {i}: {speaker} says: {text[:30]}...")
+
+    # Split by speaker, keeping original indices for later reassembly
+    speaker1_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 1"]
+    speaker2_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 2"]
+
+    # Print the split results to verify
+    print(f"\nDEBUG - Speaker 1 lines ({len(speaker1_lines)} total):")
+    for i, text in speaker1_lines[:min(3, len(speaker1_lines))]:
+        print(f"  Original index {i}: {text[:30]}...")
+
+    print(f"\nDEBUG - Speaker 2 lines ({len(speaker2_lines)} total):")
+    for i, text in speaker2_lines[:min(3, len(speaker2_lines))]:
+        print(f"  Original index {i}: {text[:30]}...")
+
+    # === PARALLEL GPU PROCESSING EXPLANATION ===
+    # This is how we process Speaker 1 and Speaker 2 lines simultaneously on separate GPUs:
+    #
+    # 1. Function Definition:
+    #    @app.function(gpu=modal.gpu.A100(count=1))
+    #    def generate_speaker_audio(...):
+    #
+    #    The "count=1" means each CONTAINER gets 1 GPU, not that the entire app uses only 1 GPU.
+    #
+    # 2. Parallel Execution:
+    #    speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
+    #    speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
+    #
+    #    Each .remote() call spawns a separate container with its own dedicated GPU.
+    #    These containers run simultaneously in Modal's cloud infrastructure.
+    #
+    # 3. Result:
+    #    - Speaker 1 lines process on GPU #1 in Container #1
+    #    - Speaker 2 lines process on GPU #2 in Container #2
+    #    - Both run in parallel, potentially cutting processing time nearly in half
+    #
+    # This is much more efficient than processing all lines sequentially on a single GPU.
+
+    print("\nDEBUG - Starting parallel processing of speakers:")
+    # Process each speaker's lines in parallel
+    speaker1_results = []
+    speaker2_results = []
+
+    # Only process if there are lines for that speaker
+    if speaker1_lines:
+        print(f"  Sending {len(speaker1_lines)} Speaker 1 lines to GPU #1")
+        speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
+
+    if speaker2_lines:
+        print(f"  Sending {len(speaker2_lines)} Speaker 2 lines to GPU #2")
+        speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
+
+    # --- Step 4: Combine results in original script order ---
+    all_results = speaker1_results + speaker2_results
+    all_results.sort(key=lambda x: x[0])  # Sort by original script line index
+
+    print(f"\nDEBUG - Received {len(all_results)} total audio segments from parallel processing")
+    print("  Recombining in original script order based on line indices...")
+
+    # --- Step 5: Assemble final audio ---
+    segments = []
+    rates = []
+    turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)  # Silence between turns
     
-    for speaker, text in tqdm(lines, desc="🔊 Generating speech", unit="line"):
-        arr, sr = generate_speaker_audio_lowlevel(text, speaker)
-        segments.append(arr)
+    for _, audio_array, sr in all_results:
+        segments.append(audio_array)
         segments.append(turn_silence)  # Add half-second silence between turns
         rates.append(sr)
         rates.append(sr)  # Need matching rate for silence
 
-    # --- Step 3: Merge into final audio file ---
-    # Use injection_id in the filename if provided
+    # --- Step 6: Save to file ---
     if injection_id:
         file_uuid = f"{injection_id}_{os.urandom(2).hex()}"
     else:
@@ -281,9 +387,10 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         except Exception as e:
             print(f"⚠️ Error updating database: {e}")
     
-    # Clean up voice state data after successful completion!
+    # Clean up voice state data after successful completion
     if injection_id:
         # Remove all voice states for this injection to free up space
+        speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
         for speaker in speaker_voice_mapping.keys():
             voice_state_key = f"{injection_id}_{speaker}"
             if voice_states.contains(voice_state_key):
