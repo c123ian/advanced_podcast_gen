@@ -1,0 +1,38 @@
+Speaker 1: Welcome to today's episode of "Aunt-ificial Intelligence"! I'm your host, and I'm super excited to dive into this fascinating topic with my guest, an expert in artificial intelligence. So, let's get started! We're going to explore how to create a production-grade LLM that uses RAG to retrieve relevant articles to inform LLMs" life/relationship advice. But before we begin, I want to give you a quick rundown of what we'll be covering today. We'll be talking about the importance of using agony aunts to inform LLMs, the therapeutic effectiveness of AI-based chatbots, and how to create a production-grade LLM that uses RAG to retrieve relevant articles. We'll also be diving into the technical details of how to set up and deploy this system, including the backend and frontend architecture, data collection and context, and more. So, are you ready to get started and learn how to create your very own LLM model that uses RAG to retrieve relevant articles to inform LLMs" life/relationship advice?
+
+Speaker 2: Umm, yeah, I'm ready. But, I have to ask, why agony aunts? Can't we just use a regular chatbot or something?
+
+Speaker 1: Ah, great question! So, the idea behind using agony aunts is that they provide a unique form of objectivity that we often can't get from close friends or family members. They're not there to judge us or give us advice based on their personal opinions, but rather to help us clarify our options and choices. And that's exactly what we want our LLMs to do - provide neutral, objective advice that helps people make informed decisions. Plus, agony aunts have a unique understanding of the complexities of human relationships and emotions, which is essential for providing effective advice.
+
+Speaker 2: Hmm, I see what you mean. But how do we even get started with this? I'm not a developer, and I'm not sure I understand all the technical details.
+
+Speaker 1: Don't worry, we'll take it one step at a time. First, we need to set up the backend and frontend architecture for our LLM model. We'll be using Modal Labs for hosting, which allows us to scale easily with user growth. We'll also be using OpenAI-compatible serving API structure and SQLite for fast, direct database access and conversation history storage. And for the frontend, we'll be using FastHTML with Tailwind CSS for a hypermedia-driven app development style.
+
+Speaker 2: Whoa, that's a lot of tech talk. Can you explain it in simpler terms?
+
+Speaker 1: [laughs] Okay, think of it like this: we're building a virtual assistant that uses a chatbot to help people with life and relationship advice. The backend is like the brain of the operation, and the frontend is like the user interface. We're using Modal Labs to host our chatbot, and OpenAI-compatible serving API structure to make it work with other AI systems. And for the frontend, we're using a special kind of HTML that makes it easy to build a user-friendly interface.
+
+Speaker 2: I think I understand a little better now. But what about the data collection and context? How do we make sure our LLM model is getting the right information?
+
+Speaker 1: Ah, great question again! So, we're using a dataset of agony aunt columns to train our LLM model. We're taking the questions and answers from these columns and using them to inform our model's responses. And to make sure our model is getting the right information, we're using a technique called RAG, or Retrieval-Augmented Generation. This allows our model to retrieve relevant articles from the agony aunt dataset and use them to inform its responses.
+
+Speaker 2: Hmm, that sounds like a lot of work. Is it worth it?
+
+Speaker 1: Absolutely! By using RAG and agony aunt columns, we can create a model that provides neutral, objective advice that's tailored to the user's specific needs. And with the right setup and deployment, we can make sure our model is scalable and efficient, so it can handle a high volume of users. Plus, it's a great way to provide people with valuable advice and support in a way that's accessible and user-friendly.
+
+Speaker 2: Okay, I think I'm starting to get the picture. But what about the technical details? How do we set up and deploy this system?
+
+Speaker 1: Ah, that's the fun part! We'll be using a combination of Python decorators and API endpoints to set up our backend and frontend architecture. We'll also be using SQLite for database storage and FastHTML for the frontend interface. And to make sure our model is integrated with the rest of the system, we'll be using a technique called Model Integration Considerations.
+
+Speaker 2: (excitedly) Oh, I'm so excited to learn more about this! Can you walk me through the process step by step?
+
+Speaker 1: (smiling) Absolutely! We'll take it one step at a time, and I'll explain each step in detail. We'll cover everything from setting up the backend and frontend architecture to deploying the system and testing its performance. And along the way, we'll be discussing the technical details and best practices for building a scalable and efficient LLM model. So, are you ready to get started?
+
+Speaker 2: (excitedly) Yes! Let's do it!
+
+Speaker 1: we're building a virtual assistant that uses a chatbot to help people with life and relationship advice."),
+
+Speaker 1: 
+
+Speaker 1: we're building a virtual assistant that uses a chatbot to help people with life and relationship advice."),
+
