@@ -11,7 +11,7 @@ common_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install("git", "ffmpeg")  
     .pip_install(
-        "torch==2.5.1",  # temp fic to avoid stricter security check by torch: https://github.com/suno-ai/bark/pull/619
+        "torch==2.5.1",  # temp fix to avoid stricter security check by torch: https://github.com/suno-ai/bark/pull/619
         "PyPDF2",
         "python-fasthtml==0.12.0",
         "langchain",
@@ -25,7 +25,7 @@ common_image = (
         "scipy",
         "transformers==4.46.1",
         "accelerate==1.2.1",
+        "sumy>=0.11.0",  # Add sumy for dedicated summarization
         "git+https://github.com/suno-ai/bark.git"
     )
 )
-
