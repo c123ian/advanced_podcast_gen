@@ -26,14 +26,30 @@ generate_audio = modal.Function.from_name("multi-file-podcast", "generate_audio"
 
 # HELPER CLASSES
 
+# Global config at module level - single consistent limit
+MAX_CONTENT_CHARS = 45000  # ~18,750 tokens
 
 class BaseIngestor:
     """Base class for all ingestors"""
     def validate(self, source: str) -> bool:
         pass
 
-    def extract_text(self, source: str, max_chars: int = 100000) -> Optional[str]:
+    def extract_text(self, source: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
         pass
+    
+    def truncate_with_warning(self, text: str, max_chars: int) -> str:
+        """Intelligently truncate text with warning message"""
+        if len(text) <= max_chars:
+            return text
+            
+        truncated = text[:max_chars]
+        print(f"⚠️ Content truncated from {len(text)} to {max_chars} characters")
+        
+        # Add an explanatory note at the end
+        truncation_note = "\n\n[Note: The original content was truncated due to length limitations.]"
+        truncated = truncated[:max_chars - len(truncation_note)] + truncation_note
+        
+        return truncated
 
 
 class PDFIngestor(BaseIngestor):
@@ -47,7 +63,7 @@ class PDFIngestor(BaseIngestor):
             return False
         return True
 
-    def extract_text(self, file_path: str, max_chars: int = 100000) -> Optional[str]:
+    def extract_text(self, file_path: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
         if not self.validate(file_path):
             return None
         try:
@@ -60,15 +76,14 @@ class PDFIngestor(BaseIngestor):
                 for page_num in range(num_pages):
                     page_text = pdf_reader.pages[page_num].extract_text()
                     if page_text:
-                        total_chars += len(page_text)
-                        if total_chars > max_chars:
-                            remaining_chars = max_chars - total_chars
-                            extracted_text.append(page_text[:remaining_chars])
-                            print(f"Reached {max_chars} character limit at page {page_num + 1}")
-                            break
                         extracted_text.append(page_text)
-                        print(f"Processed page {page_num + 1}/{num_pages}")
-                return "\n".join(extracted_text)
+                        total_chars += len(page_text)
+                        print(f"Processed page {page_num + 1}/{num_pages}, total chars: {total_chars}")
+                        if total_chars > max_chars * 1.1:  # Read slightly more than needed
+                            print(f"Reached character limit at page {page_num + 1}/{num_pages}")
+                            break
+                full_text = "\n".join(extracted_text)
+                return self.truncate_with_warning(full_text, max_chars)
         except PyPDF2.PdfReadError:
             print("Error: Invalid or corrupted PDF file")
             return None
@@ -85,18 +100,15 @@ class WebsiteIngestor(BaseIngestor):
             return False
         return True
 
-    def extract_text(self, url: str, max_chars: int = 100000) -> Optional[str]:
+    def extract_text(self, url: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
         if not self.validate(url):
             return None
         try:
             loader = WebBaseLoader(url)
             documents = loader.load()
             extracted_text = "\n".join([doc.page_content for doc in documents])
-            if len(extracted_text) > max_chars:
-                extracted_text = extracted_text[:max_chars]
-                print(f"Truncated extracted text to {max_chars} characters")
-            print(f"Extracted text from website: {url}")
-            return extracted_text
+            print(f"Extracted {len(extracted_text)} chars from website: {url}")
+            return self.truncate_with_warning(extracted_text, max_chars)
         except Exception as e:
             print(f"An error occurred while extracting from website: {str(e)}")
             return None
@@ -117,17 +129,14 @@ class AudioIngestor(BaseIngestor):
             return False
         return True
 
-    def extract_text(self, audio_file: str, max_chars: int = 100000) -> Optional[str]:
+    def extract_text(self, audio_file: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
         if not self.validate(audio_file):
             return None
         try:
             result = self.model.transcribe(audio_file)
             transcription = result["text"]
-            if len(transcription) > max_chars:
-                transcription = transcription[:max_chars]
-                print(f"Truncated transcription to {max_chars} characters")
-            print(f"Transcribed audio file: {audio_file}")
-            return transcription
+            print(f"Transcribed {len(transcription)} chars from audio file: {audio_file}")
+            return self.truncate_with_warning(transcription, max_chars)
         except Exception as e:
             print(f"An error occurred during audio transcription: {str(e)}")
             return None
@@ -144,17 +153,14 @@ class TextIngestor(BaseIngestor):
             return False
         return True
 
-    def extract_text(self, file_path: str, max_chars: int = 100000) -> Optional[str]:
+    def extract_text(self, file_path: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
         if not self.validate(file_path):
             return None
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 text = f.read()
-            if len(text) > max_chars:
-                print(f"Truncating text to {max_chars} chars")
-                text = text[:max_chars]
-            print(f"Extracted text from: {file_path}")
-            return text
+            print(f"Extracted {len(text)} chars from text file: {file_path}")
+            return self.truncate_with_warning(text, max_chars)
         except Exception as e:
             print(f"Error reading text file: {e}")
             return None
@@ -182,13 +188,21 @@ class IngestorFactory:
 app = modal.App("content_injection")
 
 # Directories
-UPLOAD_DIR = "/data/uploads"
-OUTPUT_DIR = "/data/processed"
-DB_PATH = "/data/injections.db"  # <-- ensure consistent path
+UPLOAD_DIR = "/data/uploads_truncate"
+OUTPUT_DIR = "/data/processed_truncate"
+DB_PATH = "/data/injections_truncate.db"  # <-- ensure consistent path
 
 # Ensure Directories Exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+# Setup NLTK for summarisation
+NLTK_DATA_DIR = "/tmp/nltk_data"
+os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+nltk.data.path.append(NLTK_DATA_DIR)
+nltk.download("punkt", download_dir=NLTK_DATA_DIR)
+nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 
 # Setup Database
 def setup_database(db_path: str):
@@ -202,6 +216,8 @@ def setup_database(db_path: str):
             input_type TEXT NOT NULL,
             processed_path TEXT,
             status TEXT DEFAULT 'pending',
+            content_length INTEGER,
+            processing_notes TEXT,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -225,7 +241,7 @@ def get_input_type(filename: str) -> str:
         raise ValueError(f"Unsupported file type: {filename}")
 
 # Process Uploaded Content
-def process_content(source_path: str, input_type: str, max_chars: int = 100000) -> Optional[str]:
+def process_content(source_path: str, input_type: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
     """Processes content using the appropriate ingestor"""
     ingestor = IngestorFactory.get_ingestor(input_type)
     if not ingestor:
@@ -300,6 +316,12 @@ def serve():
             cls="flex w-full"
         )
         
+        # Content limits information
+        content_info = Div(
+            P(f"Maximum content length: {MAX_CONTENT_CHARS//1000}K characters (longer content will be truncated)",
+              cls="text-sm text-center opacity-70 mt-2")
+        )
+        
         # Process button (no spinner initially)
         process_button = Button(
             "Process Content",
@@ -337,6 +359,7 @@ def serve():
 
         upload_form = Form(
             side_by_side,
+            content_info,
             process_button,
             loading_script,
             hx_post="/inject",
@@ -422,12 +445,15 @@ def serve():
                     id="injection-status"
                 )
 
-            # Insert record into database
+            # Insert record into database with content size info
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO injections (id, original_filename, input_type, status) VALUES (?, ?, ?, ?)",
-                (injection_id, original_filename, input_type, "processing")
+                """INSERT INTO injections 
+                   (id, original_filename, input_type, status, content_length, processing_notes) 
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (injection_id, original_filename, input_type, "processing", 
+                 len(processed_text), f"Original content: {len(processed_text)} chars")
             )
             conn.commit()
             conn.close()
@@ -488,13 +514,14 @@ def serve():
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT status FROM injections WHERE id = ?", 
+            "SELECT status, content_length FROM injections WHERE id = ?", 
             (injection_id,)
         )
         result = cursor.fetchone()
         conn.close()
         
         status = result[0] if result else "unknown"
+        content_length = result[1] if result and len(result) > 1 else "unknown"
         
         # Add some pulsing circles for visual interest
         circle_animation = Div(
@@ -507,6 +534,10 @@ def serve():
             cls="w-full h-full absolute top-0 left-0 overflow-hidden"
         )
         
+        content_info = ""
+        if content_length != "unknown":
+            content_info = f", content size: {content_length} chars"
+        
         return Title("Generating Your Podcast"), Main(
             animation_style,
             circle_animation,
@@ -515,7 +546,7 @@ def serve():
                     H1("Your Podcast is Being Generated", cls="text-3xl font-bold text-center text-white mb-6"),
                     Div(
                         Div(cls="loading loading-dots loading-lg mb-6"),
-                        P(f"Current status: {status}", cls="text-lg mb-4 text-center text-white"),
+                        P(f"Current status: {status}{content_info}", cls="text-lg mb-4 text-center text-white"),
                         P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-6 text-center text-white"),
                         Div(
                             A(
@@ -545,7 +576,7 @@ def serve():
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT processed_path, status FROM injections WHERE id = ?", 
+                "SELECT processed_path, status, content_length, processing_notes FROM injections WHERE id = ?", 
                 (injection_id,)
             )
             result = cursor.fetchone()
@@ -564,7 +595,7 @@ def serve():
                     )
                 )
             
-            audio_path, status = result
+            audio_path, status, content_length, processing_notes = result
             
             if status != "completed" or not audio_path:
                 # Simple CSS animation without SVG
@@ -582,6 +613,17 @@ def serve():
                 }
                 """)
                 
+                # Content info for display
+                content_info = ""
+                if content_length:
+                    content_info = f"Content size: {content_length} characters"
+                    if content_length > MAX_CONTENT_CHARS:
+                        content_info += f" (truncated from original size)"
+                
+                processing_info = ""
+                if processing_notes:
+                    processing_info = processing_notes
+                
                 # Show the "still processing" page with manual refresh
                 return Title("Podcast Status"), Main(
                     animation_style,
@@ -592,6 +634,8 @@ def serve():
                               cls="mb-4 text-center font-bold"),
                             P("Processing usually takes 30-60 minutes depending on content length.", 
                               cls="mb-6 text-center"),
+                            P(content_info, cls="mb-2 text-sm text-center"),
+                            P(processing_info, cls="mb-6 text-sm text-center"),
                             P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-8 text-center"),
                             Button(
                                 Span("Refresh Status", cls="mr-2"),
@@ -697,6 +741,34 @@ def serve():
         """Redirect to the status page for an ID"""
         from starlette.responses import RedirectResponse
         return RedirectResponse(f"/status/{injection_id}")
+
+    @rt("/update-schema")
+    def update_schema():
+        """Update database schema if needed"""
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Check if columns exist first
+        cursor.execute("PRAGMA table_info(injections)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'content_length' not in columns:
+            cursor.execute("ALTER TABLE injections ADD COLUMN content_length INTEGER")
+        
+        if 'processing_notes' not in columns:
+            cursor.execute("ALTER TABLE injections ADD COLUMN processing_notes TEXT")
+            
+        conn.commit()
+        conn.close()
+        
+        return Title("Database Updated"), Main(
+            Div(
+                H1("Database Schema Updated", cls="text-2xl font-bold text-center mb-4"),
+                P("The database schema has been updated to track content lengths.", cls="text-center mb-4"),
+                A("← Back to Home", href="/", cls="btn btn-primary mt-4 block mx-auto"),
+                cls="container mx-auto px-4 py-8 max-w-3xl"
+            )
+        )
 
     return fasthtml_app
 
