@@ -17,6 +17,10 @@ voice_states = modal.Dict.from_name("voice-states", create_if_missing=True)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Script length limits for safety
+MAX_SCRIPT_LINES = 30  # Absolute maximum for safety
+TARGET_SCRIPT_LINES = 15  # Ideal length for a podcast
+
 # Setup NLTK for sentence splitting
 NLTK_DATA_DIR = "/tmp/nltk_data"
 os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -225,6 +229,35 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             seg_audio = numpy_to_audio_segment(seg, sr)
             final_audio = seg_audio if final_audio is None else final_audio.append(seg_audio, crossfade=100)
         return final_audio
+        
+    def update_database(injection_id, field, value):
+        """Helper function to update database fields"""
+        if not injection_id:
+            return
+            
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections.db"
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # First check if the field exists
+            cursor.execute(f"PRAGMA table_info(injections)")
+            columns = [col[1] for col in cursor.fetchall()]
+            
+            if field in columns:
+                cursor.execute(
+                    f"UPDATE injections SET {field} = ? WHERE id = ?",
+                    (value, injection_id)
+                )
+                conn.commit()
+                print(f"✅ Updated {field} in database for ID: {injection_id}")
+            else:
+                print(f"⚠️ Field '{field}' doesn't exist in database schema")
+                
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Error updating database: {e}")
 
     # --- Step 1: Decode the serialized script ---
     try:
@@ -242,7 +275,21 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         lines = normalize_script_format(script_data)
         print(f"Successfully decoded script with {len(lines)} dialogue lines")
 
-        # 50 seconds per line TTS generation estimate
+        # Final safety check for script length
+        if len(lines) > MAX_SCRIPT_LINES:
+            print(f"⚠️ Script exceeds maximum length ({len(lines)} > {MAX_SCRIPT_LINES}), truncating...")
+            truncated_lines = len(lines) - MAX_SCRIPT_LINES
+            lines = lines[:MAX_SCRIPT_LINES]
+            
+            # Update processing notes
+            update_database(
+                injection_id, 
+                "processing_notes", 
+                f"Script was truncated from {len(script_data)} to {MAX_SCRIPT_LINES} lines (removed {truncated_lines} lines)"
+            )
+            print(f"Script truncated to {len(lines)} lines")
+
+        # Calculate estimated processing time
         estimated_time = estimate_processing_time(lines)
         print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
         
@@ -256,16 +303,15 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             ("Speaker 2", "That's fascinating. What else should we know?")
         ]
         print("Using fallback script instead")
+        
+        # Update database with error info
+        update_database(
+            injection_id, 
+            "processing_notes", 
+            f"Error decoding script: {str(e)}. Using fallback script instead."
+        )
 
     # --- SPEAKER SEPARATION FOR PARALLEL PROCESSING ---
-    # Original script format is a list of tuples like:
-    # [
-    #   ("Speaker 1", "Welcome to our podcast..."),  # index 0
-    #   ("Speaker 2", "Thanks for having me..."),    # index 1
-    #   ("Speaker 1", "Today we're discussing..."),  # index 2
-    #   ...
-    # ]
-
     # Print the first few lines to verify input format
     print("DEBUG - Original script format:")
     for i, (speaker, text) in enumerate(lines[:min(3, len(lines))]):
@@ -283,29 +329,6 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     print(f"\nDEBUG - Speaker 2 lines ({len(speaker2_lines)} total):")
     for i, text in speaker2_lines[:min(3, len(speaker2_lines))]:
         print(f"  Original index {i}: {text[:30]}...")
-
-    # === PARALLEL GPU PROCESSING EXPLANATION ===
-    # This is how we process Speaker 1 and Speaker 2 lines simultaneously on separate GPUs:
-    #
-    # 1. Function Definition:
-    #    @app.function(gpu=modal.gpu.A100(count=1))
-    #    def generate_speaker_audio(...):
-    #
-    #    The "count=1" means each CONTAINER gets 1 GPU, not that the entire app uses only 1 GPU.
-    #
-    # 2. Parallel Execution:
-    #    speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
-    #    speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
-    #
-    #    Each .remote() call spawns a separate container with its own dedicated GPU.
-    #    These containers run simultaneously in Modal's cloud infrastructure.
-    #
-    # 3. Result:
-    #    - Speaker 1 lines process on GPU #1 in Container #1
-    #    - Speaker 2 lines process on GPU #2 in Container #2
-    #    - Both run in parallel, potentially cutting processing time nearly in half
-    #
-    # This is much more efficient than processing all lines sequentially on a single GPU.
 
     print("\nDEBUG - Starting parallel processing of speakers:")
     # Process each speaker's lines in parallel
@@ -350,42 +373,16 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     final_clip = concatenate_audio_segments(segments, rates)
     final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
 
-    # Update database if injection_id is provided
-    if injection_id:
-        try:
-            import sqlite3
-            DB_PATH = "/data/injections.db"
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE injections SET processed_path = ?, status = 'completed' WHERE id = ?",
-                (final_audio_path, injection_id)
-            )
-            conn.commit()
-            conn.close()
-            print(f"✅ Database updated for injection ID: {injection_id}")
-        except Exception as e:
-            print(f"⚠️ Error updating database: {e}")
+    # Update database with completed status
+    update_database(injection_id, "processed_path", final_audio_path)
+    update_database(injection_id, "status", "completed")
+
+    # Add processing note about completion
+    processing_note = f"Generated audio with {len(lines)} dialogue lines. Audio saved to {os.path.basename(final_audio_path)}"
+    update_database(injection_id, "processing_notes", processing_note)
 
     # Explicitly commit volume changes so other containers can access it
     shared_volume.commit()
-
-    # At the end of the function, make sure the database is updated:
-    if injection_id:
-        try:
-            import sqlite3
-            DB_PATH = "/data/injections.db"
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE injections SET processed_path = ?, status = 'completed' WHERE id = ?",
-                (final_audio_path, injection_id)
-            )
-            conn.commit()
-            conn.close()
-            print(f"✅ Database updated for injection ID: {injection_id} - Status: completed")
-        except Exception as e:
-            print(f"⚠️ Error updating database: {e}")
     
     # Clean up voice state data after successful completion
     if injection_id:
