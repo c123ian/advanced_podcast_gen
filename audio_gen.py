@@ -120,9 +120,41 @@ def convert_disfluencies(text):
 def generate_speaker_audio(speaker_lines: List[Tuple[int, str]], 
                           speaker: str, 
                           injection_id: str = None) -> List[Tuple[int, np.ndarray, int]]:
-    """Generate audio for all lines from a single speaker"""
+    """Generate audio for all lines from a single speaker with progress updates"""
     print(f"🎙️ Starting audio generation for {speaker} with {len(speaker_lines)} lines")
     preload_models()  # Ensure Bark model is loaded
+
+    def update_speaker_status(progress_msg):
+        """Helper to update database with current speaker progress"""
+        if not injection_id:
+            return
+            
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections_truncate.db"
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # First get the current status and notes
+            cursor.execute(
+                "SELECT status, processing_notes FROM injections WHERE id = ?",
+                (injection_id,)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                status, notes = result
+                # Only update notes, keep status as "processing"
+                new_notes = f"{speaker}: {progress_msg}"
+                cursor.execute(
+                    "UPDATE injections SET processing_notes = ? WHERE id = ?",
+                    (new_notes, injection_id)
+                )
+                conn.commit()
+                print(f"✅ Updated progress for {speaker} in database: {progress_msg}")
+            conn.close()
+        except Exception as e:
+            print(f"⚠️ Error updating speaker status: {e}")
 
     def sentence_splitter(text):
         return nltk.sent_tokenize(text)
@@ -160,9 +192,17 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
     text_temp = 0.6
     waveform_temp = 0.6
     
+    # Update initial progress
+    update_speaker_status(f"Starting audio generation for {len(speaker_lines)} lines")
+    
     # Process each line for this speaker
     results = []
-    for line_idx, text in tqdm(speaker_lines, desc=f"Generating {speaker} audio"):
+    for i, (line_idx, text) in enumerate(tqdm(speaker_lines, desc=f"Generating {speaker} audio")):
+        # Progress update every few lines
+        if i % 3 == 0 or i == len(speaker_lines) - 1:
+            progress_pct = int((i + 1) / len(speaker_lines) * 100)
+            update_speaker_status(f"Generating line {i+1}/{len(speaker_lines)} ({progress_pct}% complete)")
+        
         # Process disfluencies in the text
         text = convert_disfluencies(text)
         sentences = sentence_splitter(preprocess_text(text))
@@ -196,6 +236,8 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
         results.append((line_idx, line_audio, SAMPLE_RATE))
         print(f"Completed line {line_idx} for {speaker}")
     
+    # Final status update
+    update_speaker_status(f"Completed audio generation for all {len(speaker_lines)} lines")
     print(f"✅ Completed all {len(speaker_lines)} lines for {speaker}")
     return results
 
@@ -211,8 +253,41 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
 def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     """
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
-    """    
+    Now with more granular status updates for real-time monitoring
+    """
+    def update_status(status, notes=None):
+        """Helper function to update database status and notes"""
+        if not injection_id:
+            return
+            
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections_truncate.db"
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            if notes:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, processing_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, notes, injection_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, injection_id)
+                )
+            conn.commit()
+            conn.close()
+            print(f"✅ Updated status to '{status}' for ID: {injection_id}")
+            if notes:
+                print(f"📝 Notes: {notes}")
+        except Exception as e:
+            print(f"⚠️ Error updating database: {e}")
+    
     print(f"🔊 Bark TTS starting with parallel processing. Received encoded script of size: {len(encoded_script)} bytes")
+    
+    # First status update - starting processing
+    update_status("processing", "Preparing to generate audio...")
 
     def numpy_to_audio_segment(audio_arr, sr):
         """Converts numpy audio array to an AudioSegment"""
@@ -229,170 +304,185 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             seg_audio = numpy_to_audio_segment(seg, sr)
             final_audio = seg_audio if final_audio is None else final_audio.append(seg_audio, crossfade=100)
         return final_audio
-        
-    def update_database(injection_id, field, value):
-        """Helper function to update database fields"""
-        if not injection_id:
-            return
-            
-        try:
-            import sqlite3
-            DB_PATH = "/data/injections.db"
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            
-            # First check if the field exists
-            cursor.execute(f"PRAGMA table_info(injections)")
-            columns = [col[1] for col in cursor.fetchall()]
-            
-            if field in columns:
-                cursor.execute(
-                    f"UPDATE injections SET {field} = ? WHERE id = ?",
-                    (value, injection_id)
-                )
-                conn.commit()
-                print(f"✅ Updated {field} in database for ID: {injection_id}")
-            else:
-                print(f"⚠️ Field '{field}' doesn't exist in database schema")
-                
-            conn.close()
-        except Exception as e:
-            print(f"⚠️ Error updating database: {e}")
 
-    # --- Step 1: Decode the serialized script ---
     try:
-        print("Decoding base64 script data...")
-        binary_data = base64.b64decode(encoded_script.encode('utf-8'))
-        
-        print("Unpickling script data...")
-        script_data = pickle.loads(binary_data)
-        
-        print(f"Received script data type: {type(script_data)}")
-        if isinstance(script_data, list):
-            print(f"Script contains {len(script_data)} items")
+        # --- Step 1: Decode the serialized script ---
+        update_status("processing", "Decoding script data...")
+        try:
+            print("Decoding base64 script data...")
+            binary_data = base64.b64decode(encoded_script.encode('utf-8'))
             
-        # Normalize the script format
-        lines = normalize_script_format(script_data)
-        print(f"Successfully decoded script with {len(lines)} dialogue lines")
-
-        # Final safety check for script length
-        if len(lines) > MAX_SCRIPT_LINES:
-            print(f"⚠️ Script exceeds maximum length ({len(lines)} > {MAX_SCRIPT_LINES}), truncating...")
-            truncated_lines = len(lines) - MAX_SCRIPT_LINES
-            lines = lines[:MAX_SCRIPT_LINES]
+            print("Unpickling script data...")
+            script_data = pickle.loads(binary_data)
             
-            # Update processing notes
-            update_database(
-                injection_id, 
-                "processing_notes", 
-                f"Script was truncated from {len(script_data)} to {MAX_SCRIPT_LINES} lines (removed {truncated_lines} lines)"
-            )
-            print(f"Script truncated to {len(lines)} lines")
+            print(f"Received script data type: {type(script_data)}")
+            if isinstance(script_data, list):
+                print(f"Script contains {len(script_data)} items")
+                
+            # Normalize the script format
+            lines = normalize_script_format(script_data)
+            print(f"Successfully decoded script with {len(lines)} dialogue lines")
+            
+            update_status("processing", f"Preparing to generate audio for {len(lines)} dialogue lines")
 
-        # Calculate estimated processing time
-        estimated_time = estimate_processing_time(lines)
-        print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
+            # Final safety check for script length
+            if len(lines) > MAX_SCRIPT_LINES:
+                print(f"⚠️ Script exceeds maximum length ({len(lines)} > {MAX_SCRIPT_LINES}), truncating...")
+                truncated_lines = len(lines) - MAX_SCRIPT_LINES
+                lines = lines[:MAX_SCRIPT_LINES]
+                
+                # Update processing notes
+                update_status(
+                    "processing", 
+                    f"Script truncated from {len(script_data)} to {MAX_SCRIPT_LINES} lines (removed {truncated_lines} lines)"
+                )
+                print(f"Script truncated to {len(lines)} lines")
+
+            # Calculate estimated processing time
+            estimated_time = estimate_processing_time(lines)
+            print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
+            update_status("processing", f"Estimated processing time: {estimated_time}")
+            
+        except Exception as e:
+            print(f"❌ Error decoding serialized script: {e}")
+            update_status("error", f"Error decoding script: {str(e)}")
+            
+            # Create a minimal fallback script
+            lines = [
+                ("Speaker 1", "Welcome to our podcast. Today we're discussing an interesting topic."),
+                ("Speaker 2", "I'm excited to learn more about this. Could you tell us more?"),
+                ("Speaker 1", "Of course! Let me explain some key points."),
+                ("Speaker 2", "That's fascinating. What else should we know?")
+            ]
+            print("Using fallback script instead")
+            update_status("processing", f"Using fallback script due to error: {str(e)}")
+
+        # --- SPEAKER SEPARATION FOR PARALLEL PROCESSING ---
+        update_status("processing", "Separating speaker dialogue for parallel processing...")
         
-    except Exception as e:
-        print(f"❌ Error decoding serialized script: {e}")
-        # Create a minimal fallback script
-        lines = [
-            ("Speaker 1", "Welcome to our podcast. Today we're discussing an interesting topic."),
-            ("Speaker 2", "I'm excited to learn more about this. Could you tell us more?"),
-            ("Speaker 1", "Of course! Let me explain some key points."),
-            ("Speaker 2", "That's fascinating. What else should we know?")
-        ]
-        print("Using fallback script instead")
+        # Print the first few lines to verify input format
+        print("DEBUG - Original script format:")
+        for i, (speaker, text) in enumerate(lines[:min(3, len(lines))]):
+            print(f"  Line {i}: {speaker} says: {text[:30]}...")
+
+        # Split by speaker, keeping original indices for later reassembly
+        speaker1_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 1"]
+        speaker2_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 2"]
+
+        # Print the split results to verify
+        print(f"\nDEBUG - Speaker 1 lines ({len(speaker1_lines)} total):")
+        for i, text in speaker1_lines[:min(3, len(speaker1_lines))]:
+            print(f"  Original index {i}: {text[:30]}...")
+
+        print(f"\nDEBUG - Speaker 2 lines ({len(speaker2_lines)} total):")
+        for i, text in speaker2_lines[:min(3, len(speaker2_lines))]:
+            print(f"  Original index {i}: {text[:30]}...")
+
+        print("\nDEBUG - Starting parallel processing of speakers:")
+        # Process each speaker's lines in parallel
+        speaker1_results = []
+        speaker2_results = []
+
+        # Only process if there are lines for that speaker
+        if speaker1_lines:
+            print(f"  Sending {len(speaker1_lines)} Speaker 1 lines to GPU #1")
+            update_status("processing", f"Generating voice for Speaker 1 ({len(speaker1_lines)} lines)...")
+            speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
+
+        if speaker2_lines:
+            print(f"  Sending {len(speaker2_lines)} Speaker 2 lines to GPU #2")
+            update_status("processing", f"Generating voice for Speaker 2 ({len(speaker2_lines)} lines)...")
+            speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
+
+        # --- Step 4: Combine results in original script order ---
+        update_status("processing", "Speaker audio generated. Combining audio segments...")
+        all_results = speaker1_results + speaker2_results
+        all_results.sort(key=lambda x: x[0])  # Sort by original script line index
+
+        print(f"\nDEBUG - Received {len(all_results)} total audio segments from parallel processing")
+        print("  Recombining in original script order based on line indices...")
+
+        # --- Step 5: Assemble final audio ---
+        update_status("processing", "Assembling final podcast audio...")
+        segments = []
+        rates = []
+        turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)  # Silence between turns
         
-        # Update database with error info
-        update_database(
-            injection_id, 
-            "processing_notes", 
-            f"Error decoding script: {str(e)}. Using fallback script instead."
+        for _, audio_array, sr in all_results:
+            segments.append(audio_array)
+            segments.append(turn_silence)  # Add half-second silence between turns
+            rates.append(sr)
+            rates.append(sr)  # Need matching rate for silence
+
+        # --- Step 6: Save to file ---
+        update_status("processing", "Saving final podcast audio file...")
+        if injection_id:
+            file_uuid = f"{injection_id}_{os.urandom(2).hex()}"
+        else:
+            file_uuid = os.urandom(4).hex()
+            
+        final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"podcast_audio_{file_uuid}.wav")
+
+        final_clip = concatenate_audio_segments(segments, rates)
+        final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
+
+        # Update database with completed status
+        update_status(
+            "completed", 
+            f"Generated podcast with {len(lines)} dialogue lines. Audio saved as {os.path.basename(final_audio_path)}"
         )
 
-    # --- SPEAKER SEPARATION FOR PARALLEL PROCESSING ---
-    # Print the first few lines to verify input format
-    print("DEBUG - Original script format:")
-    for i, (speaker, text) in enumerate(lines[:min(3, len(lines))]):
-        print(f"  Line {i}: {speaker} says: {text[:30]}...")
+        # Update database with information
+        def update_database(injection_id, field, value):
+            """Helper function to update database fields"""
+            if not injection_id:
+                return
+                
+            try:
+                import sqlite3
+                DB_PATH = "/data/injections_truncate.db"
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                
+                # First check if the field exists
+                cursor.execute(f"PRAGMA table_info(injections)")
+                columns = [col[1] for col in cursor.fetchall()]
+                
+                if field in columns:
+                    cursor.execute(
+                        f"UPDATE injections SET {field} = ? WHERE id = ?",
+                        (value, injection_id)
+                    )
+                    conn.commit()
+                    print(f"✅ Updated {field} in database for ID: {injection_id}")
+                else:
+                    print(f"⚠️ Field '{field}' doesn't exist in database schema")
+                    
+                conn.close()
+            except Exception as e:
+                print(f"⚠️ Error updating database: {e}")
 
-    # Split by speaker, keeping original indices for later reassembly
-    speaker1_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 1"]
-    speaker2_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 2"]
+        # Update database with completed status
+        update_database(injection_id, "processed_path", final_audio_path)
 
-    # Print the split results to verify
-    print(f"\nDEBUG - Speaker 1 lines ({len(speaker1_lines)} total):")
-    for i, text in speaker1_lines[:min(3, len(speaker1_lines))]:
-        print(f"  Original index {i}: {text[:30]}...")
-
-    print(f"\nDEBUG - Speaker 2 lines ({len(speaker2_lines)} total):")
-    for i, text in speaker2_lines[:min(3, len(speaker2_lines))]:
-        print(f"  Original index {i}: {text[:30]}...")
-
-    print("\nDEBUG - Starting parallel processing of speakers:")
-    # Process each speaker's lines in parallel
-    speaker1_results = []
-    speaker2_results = []
-
-    # Only process if there are lines for that speaker
-    if speaker1_lines:
-        print(f"  Sending {len(speaker1_lines)} Speaker 1 lines to GPU #1")
-        speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
-
-    if speaker2_lines:
-        print(f"  Sending {len(speaker2_lines)} Speaker 2 lines to GPU #2")
-        speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
-
-    # --- Step 4: Combine results in original script order ---
-    all_results = speaker1_results + speaker2_results
-    all_results.sort(key=lambda x: x[0])  # Sort by original script line index
-
-    print(f"\nDEBUG - Received {len(all_results)} total audio segments from parallel processing")
-    print("  Recombining in original script order based on line indices...")
-
-    # --- Step 5: Assemble final audio ---
-    segments = []
-    rates = []
-    turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)  # Silence between turns
-    
-    for _, audio_array, sr in all_results:
-        segments.append(audio_array)
-        segments.append(turn_silence)  # Add half-second silence between turns
-        rates.append(sr)
-        rates.append(sr)  # Need matching rate for silence
-
-    # --- Step 6: Save to file ---
-    if injection_id:
-        file_uuid = f"{injection_id}_{os.urandom(2).hex()}"
-    else:
-        file_uuid = os.urandom(4).hex()
+        # Explicitly commit volume changes so other containers can access it
+        shared_volume.commit()
         
-    final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"podcast_audio_{file_uuid}.wav")
+        # Clean up voice state data after successful completion
+        if injection_id:
+            # Remove all voice states for this injection to free up space
+            speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
+            for speaker in speaker_voice_mapping.keys():
+                voice_state_key = f"{injection_id}_{speaker}"
+                if voice_states.contains(voice_state_key):
+                    voice_states.pop(voice_state_key)
+                    print(f"Cleaned up voice state for {voice_state_key}")
 
-    final_clip = concatenate_audio_segments(segments, rates)
-    final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
-
-    # Update database with completed status
-    update_database(injection_id, "processed_path", final_audio_path)
-    update_database(injection_id, "status", "completed")
-
-    # Add processing note about completion
-    processing_note = f"Generated audio with {len(lines)} dialogue lines. Audio saved to {os.path.basename(final_audio_path)}"
-    update_database(injection_id, "processing_notes", processing_note)
-
-    # Explicitly commit volume changes so other containers can access it
-    shared_volume.commit()
-    
-    # Clean up voice state data after successful completion
-    if injection_id:
-        # Remove all voice states for this injection to free up space
-        speaker_voice_mapping = {"Speaker 1": "v2/en_speaker_9", "Speaker 2": "v2/en_speaker_6"}
-        for speaker in speaker_voice_mapping.keys():
-            voice_state_key = f"{injection_id}_{speaker}"
-            if voice_states.contains(voice_state_key):
-                voice_states.pop(voice_state_key)
-                print(f"Cleaned up voice state for {voice_state_key}")
-
-    print(f"✅ Done. Final audio saved at: {final_audio_path}")
-    return final_audio_path
+        print(f"✅ Done. Final audio saved at: {final_audio_path}")
+        return final_audio_path
+        
+    except Exception as e:
+        error_message = f"Error during audio generation: {str(e)}"
+        print(f"❌ {error_message}")
+        update_status("error", error_message)
+        raise e
