@@ -253,7 +253,7 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
 def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     """
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
-    Now with more granular status updates for real-time monitoring
+    Now with simplified path handling and multiple volume commits for reliability
     """
     def update_status(status, notes=None):
         """Helper function to update database status and notes"""
@@ -394,7 +394,7 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             update_status("processing", f"Generating voice for Speaker 2 ({len(speaker2_lines)} lines)...")
             speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
 
-        # --- Step 4: Combine results in original script order ---
+        # --- Combine results in original script order ---
         update_status("processing", "Speaker audio generated. Combining audio segments...")
         all_results = speaker1_results + speaker2_results
         all_results.sort(key=lambda x: x[0])  # Sort by original script line index
@@ -402,7 +402,7 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         print(f"\nDEBUG - Received {len(all_results)} total audio segments from parallel processing")
         print("  Recombining in original script order based on line indices...")
 
-        # --- Step 5: Assemble final audio ---
+        # --- Assemble final audio ---
         update_status("processing", "Assembling final podcast audio...")
         segments = []
         rates = []
@@ -414,27 +414,27 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             rates.append(sr)
             rates.append(sr)  # Need matching rate for silence
 
-        # --- Step 6: Save to file ---
+        # --- Define standardized output path ---
+        # Use a consistent file naming pattern based on injection_id
+        final_audio_path = f"/data/podcast_audio/podcast_{injection_id}.wav"
+        
+        # --- Save to file ---
         update_status("processing", "Saving final podcast audio file...")
-        if injection_id:
-            file_uuid = f"{injection_id}_{os.urandom(2).hex()}"
-        else:
-            file_uuid = os.urandom(4).hex()
-            
-        final_audio_path = os.path.join(AUDIO_OUTPUT_DIR, f"podcast_audio_{file_uuid}.wav")
-
         final_clip = concatenate_audio_segments(segments, rates)
         final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
 
-        # Update database with completed status
+        # Early commit to ensure file is visible
+        shared_volume.commit()
+        
+        # Update database with completed status and the final path
         update_status(
             "completed", 
-            f"Generated podcast with {len(lines)} dialogue lines. Audio saved as {os.path.basename(final_audio_path)}"
+            f"Generated podcast with {len(lines)} dialogue lines. Audio saved as podcast_{injection_id}.wav"
         )
 
-        # Update database with information
-        def update_database(injection_id, field, value):
-            """Helper function to update database fields"""
+        # Update database with file path information
+        def update_database_path(injection_id, path):
+            """Helper function to update the audio file path in database"""
             if not injection_id:
                 return
                 
@@ -444,28 +444,20 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
                 conn = sqlite3.connect(DB_PATH)
                 cursor = conn.cursor()
                 
-                # First check if the field exists
-                cursor.execute(f"PRAGMA table_info(injections)")
-                columns = [col[1] for col in cursor.fetchall()]
-                
-                if field in columns:
-                    cursor.execute(
-                        f"UPDATE injections SET {field} = ? WHERE id = ?",
-                        (value, injection_id)
-                    )
-                    conn.commit()
-                    print(f"✅ Updated {field} in database for ID: {injection_id}")
-                else:
-                    print(f"⚠️ Field '{field}' doesn't exist in database schema")
-                    
+                cursor.execute(
+                    "UPDATE injections SET processed_path = ? WHERE id = ?",
+                    (path, injection_id)
+                )
+                conn.commit()
                 conn.close()
+                print(f"✅ Updated audio path in database for ID: {injection_id}")
             except Exception as e:
-                print(f"⚠️ Error updating database: {e}")
+                print(f"⚠️ Error updating database path: {e}")
 
-        # Update database with completed status
-        update_database(injection_id, "processed_path", final_audio_path)
+        # Update database with final audio path
+        update_database_path(injection_id, final_audio_path)
 
-        # Explicitly commit volume changes so other containers can access it
+        # Second explicit commit after database update
         shared_volume.commit()
         
         # Clean up voice state data after successful completion
