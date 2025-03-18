@@ -510,7 +510,7 @@ def serve():
             
             # Redirect to the generating page instead of returning HTML directly
             from starlette.responses import RedirectResponse
-            return RedirectResponse(f"/generating/{injection_id}", status_code=303)
+            return RedirectResponse(f"/generating-fixed/{injection_id}", status_code=303)
 
         except Exception as e:
             return Div(
@@ -520,6 +520,455 @@ def serve():
                 ),
                 id="injection-status"
             )
+
+    @rt("/podcast-updates-fixed/{injection_id}")
+    async def podcast_updates_fixed(injection_id: str):
+        """Fixed SSE endpoint that properly formats events for HTMX with debug logging"""
+        
+        async def event_generator():
+            # Initial connection event
+            print(f"SSE connection started for {injection_id}")
+            yield "event: message\ndata: Connected to podcast updates\n\n"
+            
+            # Immediate status check
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT status, processed_path, processing_notes FROM injections WHERE id = ?", 
+                (injection_id,)
+            )
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result:
+                status, processed_path, notes = result
+                print(f"Initial status check: status={status}, path={processed_path}, notes={notes}")
+                
+                # Send immediate status update
+                status_html = f"""
+                <div id="status-indicator" class="{'loading loading-dots loading-lg mb-6' if status != 'completed' else 'text-success mb-6'}">
+                    {'' if status != 'completed' else '<svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>'}
+                </div>
+                <p id="status-message" class="text-lg mb-2 text-center text-white">Status: {status}</p>
+                <p id="processing-notes" class="text-sm mb-4 text-center text-white">{notes}</p>
+                <p class="font-mono text-sm mb-6 text-center text-white">Podcast ID: {injection_id}</p>
+                """
+                yield f"event: status\ndata: {status_html}\n\n"
+                
+                # If already completed, send audio player immediately
+                if status == "completed" and processed_path:
+                    # First verify the file exists
+                    if os.path.exists(processed_path):
+                        print(f"File exists at path: {processed_path}, sending audio player")
+                        audio_html = f"""
+                        <div class="p-6 bg-black bg-opacity-30 backdrop-blur-sm rounded-lg mt-4">
+                            <h2 class="text-lg font-bold mb-3 text-white">Listen to Your Podcast</h2>
+                            <audio src="/audio/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>
+                            <a href="/audio/{injection_id}" download="podcast_{injection_id}.wav" 
+                               class="btn btn-secondary w-full">Download Podcast</a>
+                        </div>
+                        """
+                        yield f"event: audio\ndata: {audio_html}\n\n"
+                    else:
+                        print(f"File does not exist at path: {processed_path}")
+                        
+                        # Even if file doesn't exist, still show link to direct-audio page
+                        direct_link_html = f"""
+                        <div class="mt-4 p-4 bg-yellow-800 bg-opacity-50 rounded-lg">
+                            <p class="text-white mb-2">Audio file not found at expected location.</p>
+                            <a href="/direct-audio/{injection_id}" class="btn btn-warning w-full">Try Direct Access</a>
+                        </div>
+                        """
+                        yield f"event: audio\ndata: {direct_link_html}\n\n"
+            else:
+                print(f"No record found for ID: {injection_id}")
+                yield f"event: message\ndata: <div class='alert alert-warning'>No record found for this ID</div>\n\n"
+                
+            last_status = None
+            last_notes = None
+            sent_audio = False
+            
+            while True:
+                try:
+                    # Check database for status
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "SELECT status, processed_path, processing_notes FROM injections WHERE id = ?", 
+                        (injection_id,)
+                    )
+                    result = cursor.fetchone()
+                    conn.close()
+                    
+                    if not result:
+                        print(f"No record found for ID: {injection_id} in SSE loop")
+                        yield "event: message\ndata: <div class='alert alert-warning'>No record found for this ID</div>\n\n"
+                        await asyncio.sleep(10)
+                        continue
+                    
+                    status, processed_path, notes = result
+                    
+                    # Only send update if status or notes changed
+                    if status != last_status or notes != last_notes:
+                        print(f"Status changed: {last_status} -> {status}")
+                        last_status = status
+                        last_notes = notes
+                        
+                        # Send status update event
+                        status_html = f"""
+                        <div id="status-indicator" class="{'loading loading-dots loading-lg mb-6' if status != 'completed' else 'text-success mb-6'}">
+                            {'' if status != 'completed' else '<svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg>'}
+                        </div>
+                        <p id="status-message" class="text-lg mb-2 text-center text-white">Status: {status}</p>
+                        <p id="processing-notes" class="text-sm mb-4 text-center text-white">{notes}</p>
+                        <p class="font-mono text-sm mb-6 text-center text-white">Podcast ID: {injection_id}</p>
+                        """
+                        print(f"Sending status update event: status={status}")
+                        yield f"event: status\ndata: {status_html}\n\n"
+                        
+                        # If completed AND we have a valid path, send the audio player
+                        if status == "completed" and processed_path and not sent_audio:
+                            # First verify the file exists
+                            if os.path.exists(processed_path):
+                                print(f"File exists at path: {processed_path}, sending audio player")
+                                audio_html = f"""
+                                <div class="p-6 bg-black bg-opacity-30 backdrop-blur-sm rounded-lg mt-4">
+                                    <h2 class="text-lg font-bold mb-3 text-white">Listen to Your Podcast</h2>
+                                    <audio src="/audio/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>
+                                    <a href="/audio/{injection_id}" download="podcast_{injection_id}.wav" 
+                                       class="btn btn-secondary w-full">Download Podcast</a>
+                                </div>
+                                """
+                                yield f"event: audio\ndata: {audio_html}\n\n"
+                                sent_audio = True
+                            else:
+                                print(f"File does not exist at path: {processed_path}")
+                                yield f"event: message\ndata: File not found at {processed_path}\n\n"
+                    
+                    # Sleep before next check
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    print(f"Error in SSE generator: {str(e)}")
+                    yield f"event: error\ndata: <div class='alert alert-error'>Error: {str(e)}</div>\n\n"
+                    await asyncio.sleep(10)
+        
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream"
+        )
+
+    @rt("/audio/{injection_id}")
+    async def serve_audio(injection_id: str):
+        """Serve audio file for a specific podcast with enhanced debugging"""
+        print(f"📢 Audio request received for ID: {injection_id}")
+        
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT processed_path FROM injections WHERE id = ? AND status = 'completed'", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            print(f"❌ No database record found for ID: {injection_id}")
+            return Div(
+                P("Audio file not found: No database record"),
+                cls="alert alert-error"
+            )
+        
+        if not result[0]:
+            print(f"❌ Audio path is empty for ID: {injection_id}")
+            return Div(
+                P("Audio file not found: Empty file path"),
+                cls="alert alert-error"
+            )
+        
+        audio_path = result[0]
+        print(f"📂 Looking for audio file at path: {audio_path}")
+        
+        if not os.path.exists(audio_path):
+            print(f"❌ Audio file does not exist at path: {audio_path}")
+            # List files in the podcast_audio directory to help debug
+            audio_dir = os.path.dirname(audio_path)
+            if os.path.exists(audio_dir):
+                files = os.listdir(audio_dir)
+                print(f"📂 Files in {audio_dir}: {files}")
+                
+                # Try to find a matching file by pattern
+                matching_files = [f for f in files if injection_id in f]
+                if matching_files:
+                    print(f"📝 Found possible matching files: {matching_files}")
+                    # Use the first matching file
+                    alt_path = os.path.join(audio_dir, matching_files[0])
+                    print(f"🔄 Using alternate file path: {alt_path}")
+                    return FileResponse(
+                        alt_path,
+                        media_type="audio/wav", 
+                        filename=f"podcast_{injection_id}.wav"
+                    )
+                    
+            return Div(
+                P(f"Audio file not found on disk: {os.path.basename(audio_path)}"),
+                cls="alert alert-error"
+            )
+        
+        # Additional file info
+        file_size = os.path.getsize(audio_path)
+        print(f"✅ Serving audio file: {audio_path} (size: {file_size} bytes)")
+        
+        # Serve the actual file
+        return FileResponse(
+            audio_path, 
+            media_type="audio/wav",
+            filename=f"podcast_{injection_id}.wav"
+        )
+
+    @rt("/direct-audio/{injection_id}")
+    def direct_audio_player(injection_id: str):
+        """Direct access to podcast audio for completed podcasts"""
+        # Check database for status and audio path
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, processed_path, processing_notes FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return Title("Audio Not Found"), Main(
+                Div(
+                    H1("Podcast Not Found", cls="text-2xl font-bold text-center text-error mb-4"),
+                    P(f"No podcast found with ID: {injection_id}", cls="text-center mb-4"),
+                    A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
+                    cls="container mx-auto px-4 py-8 max-w-3xl"
+                )
+            )
+        
+        status, audio_path, notes = result
+        
+        # Check if file exists 
+        file_exists = audio_path and os.path.exists(audio_path)
+        
+        # If file doesn't exist but status is completed, try to find alternate file
+        if not file_exists and status == "completed" and audio_path:
+            # List files in the podcast_audio directory to help debug
+            audio_dir = os.path.dirname(audio_path)
+            if os.path.exists(audio_dir):
+                files = os.listdir(audio_dir)
+                print(f"📂 Files in {audio_dir}: {files}")
+                
+                # Try to find a matching file by pattern
+                matching_files = [f for f in files if injection_id in f]
+                if matching_files:
+                    print(f"📝 Found possible matching files: {matching_files}")
+                    # Use the first matching file
+                    audio_path = os.path.join(audio_dir, matching_files[0])
+                    file_exists = True
+                    print(f"🔄 Using alternate file path: {audio_path}")
+                    
+        file_size = os.path.getsize(audio_path) if file_exists else 0
+        
+        # Add animation style
+        animation_style = Style("""
+        .animated-bg {
+            background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
+            height: 100vh;
+        }
+        
+        @keyframes gradient {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        """)
+        
+        # Create audio element manually
+        audio_element = NotStr(f'<audio src="/audio/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>')
+        
+        return Title("Your Podcast"), Main(
+            animation_style,
+            Div(
+                H1("Your Podcast is Ready!", cls="text-3xl font-bold text-center text-white mb-6"),
+                
+                # Status display
+                Div(
+                    Div(
+                        # Success icon - using a simple ✓ instead of SVG
+                        Div(
+                            Span("✓", cls="text-4xl"),
+                            cls="text-success mb-6 mx-auto"
+                        ),
+                        
+                        # Status text
+                        P(f"Status: {status}", cls="text-lg mb-2 text-center text-white"),
+                        P(notes or "Processing complete.", cls="text-sm mb-4 text-center text-white"),
+                        P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-6 text-center text-white"),
+                        
+                        cls="p-6 bg-black bg-opacity-20 rounded-lg mb-6 text-center"
+                    ),
+                    
+                    # Audio player - only show if file exists
+                    file_exists and Div(
+                        H2("Listen to Your Podcast", cls="text-lg font-bold mb-3 text-white text-center"),
+                        Div(
+                            audio_element,
+                            A("Download Podcast", href=f"/audio/{injection_id}", download=f"podcast_{injection_id}.wav", 
+                            cls="btn btn-secondary w-full"),
+                            P(f"File size: {file_size / 1024 / 1024:.2f} MB", cls="text-xs text-center mt-2 text-white opacity-70"),
+                            cls="bg-black bg-opacity-30 p-4 rounded-lg"
+                        ),
+                        cls="mb-6"
+                    ) or Div(
+                        Div(
+                            P("Audio file not found. The podcast may still be processing or there may have been an issue with generation.",
+                            cls="text-warning text-center"),
+                            cls="bg-black bg-opacity-30 p-4 rounded-lg"
+                        ),
+                        cls="mb-6"
+                    ),
+                    
+                    # Return to home button
+                    A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
+                    
+                    cls="container mx-auto px-4 py-8 max-w-3xl"
+                ),
+                cls="animated-bg min-h-screen"
+            )
+        )
+        
+        
+        
+    @rt("/generating-fixed/{injection_id}")
+    def generating_podcast_fixed(injection_id: str):
+        """Updated podcast generation page with proper SSE implementation"""
+        # Add the animation style
+        animation_style = Style("""
+        .animated-bg {
+            background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
+            background-size: 400% 400%;
+            animation: gradient 15s ease infinite;
+            height: 100vh;
+        }
+        
+        @keyframes gradient {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        """)
+        
+        # Debug script
+        debug_script = Script("""
+        document.addEventListener('htmx:sseMessage', function(event) {
+            console.log('SSE event received:', event.detail);
+        });
+        
+        document.addEventListener('htmx:sseError', function(event) {
+            console.error('SSE error:', event.detail);
+        });
+        
+        // Check DB status directly after a few seconds
+        setTimeout(function() {
+            // Add alternate access link if still on initializing
+            var statusMsg = document.getElementById('status-message');
+            if (statusMsg && statusMsg.innerText.includes('Initializing')) {
+                var container = document.getElementById('direct-access');
+                container.innerHTML = `
+                    <div class="mt-6 p-4 bg-yellow-800 bg-opacity-50 rounded-lg">
+                        <p class="text-white mb-3">If your podcast is ready but not showing up, access it directly:</p>
+                        <a href="/direct-audio/${document.getElementById('injection-id').innerText}" 
+                           class="btn btn-warning w-full">Access Podcast Directly</a>
+                    </div>
+                `;
+            }
+        }, 8000);
+        """)
+        
+        # Check database for current status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, processing_notes FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        initial_status = "pending"
+        initial_notes = "Please wait while we generate your podcast..."
+        completed = False
+        
+        if result:
+            initial_status = result[0]
+            initial_notes = result[1] or initial_notes
+            completed = initial_status == "completed"
+        
+        return Title("Podcast Generator"), Main(
+            animation_style,
+            debug_script,
+            Div(
+                H1("Your Podcast is Being Generated" if not completed else "Your Podcast is Ready!", 
+                   cls="text-3xl font-bold text-center text-white mb-6"),
+                
+                # Status container with HTMX SSE
+                Div(
+                    Div(
+                        # Loading indicator (replaced by success icon when complete)
+                        Div(cls=f"{'loading loading-dots loading-lg mb-6' if not completed else 'text-success mb-6'}", id="status-indicator"),
+                        
+                        # Status text
+                        P(f"Status: {initial_status}", id="status-message", cls="text-lg mb-2 text-center text-white"),
+                        P(initial_notes, id="processing-notes", cls="text-sm mb-4 text-center text-white"),
+                        P(f"Podcast ID: {injection_id}", id="injection-id", cls="font-mono text-sm mb-6 text-center text-white"),
+                        
+                        # These attrs tell HTMX to listen for SSE events
+                        hx_ext="sse",
+                        sse_connect=f"/podcast-updates-fixed/{injection_id}",
+                        sse_swap="status",
+                        id="status-container", 
+                        cls="p-6 bg-black bg-opacity-20 rounded-lg mb-6 text-center"
+                    ),
+                    
+                    # Audio container (initially empty, filled when ready)
+                    Div(
+                        id="audio-container",
+                        hx_ext="sse",
+                        sse_connect=f"/podcast-updates-fixed/{injection_id}",
+                        sse_swap="audio",
+                    ),
+                    
+                    # Direct access container (filled by JS after a delay if needed)
+                    Div(
+                        id="direct-access",
+                        cls="mt-4"
+                    ),
+                    
+                    # If already completed, show direct link immediately
+                    completed and Div(
+                        Div(
+                            P("For direct access to your podcast:", cls="text-white mb-3"),
+                            A("Access Podcast Directly", href=f"/direct-audio/{injection_id}", 
+                             cls="btn btn-warning w-full"),
+                            cls="p-4 bg-yellow-800 bg-opacity-50 rounded-lg"
+                        ),
+                        cls="mt-6"
+                    ),
+                    
+                    # Return to home button
+                    A("← Back to Home", href="/", cls="btn btn-primary block mx-auto mt-6"),
+                    
+                    cls="container mx-auto px-4 py-8 max-w-3xl"
+                ),
+                cls="animated-bg min-h-screen"
+            )
+        )
 
     @rt("/podcast-updates/{injection_id}")
     async def podcast_updates(injection_id: str):
@@ -614,206 +1063,6 @@ def serve():
         return StreamingResponse(
             event_generator(),
             media_type="text/event-stream"
-        )
-
-    @rt("/audio/{injection_id}")
-    async def serve_audio(injection_id: str):
-        """Serve audio file for a specific podcast"""
-        print(f"📢 Audio request received for ID: {injection_id}")
-        
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT processed_path FROM injections WHERE id = ? AND status = 'completed'", 
-            (injection_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            print(f"❌ No database record found for ID: {injection_id}")
-            return Div(
-                P("Audio file not found: No database record"),
-                cls="alert alert-error"
-            )
-        
-        if not result[0]:
-            print(f"❌ Audio path is empty for ID: {injection_id}")
-            return Div(
-                P("Audio file not found: Empty file path"),
-                cls="alert alert-error"
-            )
-        
-        if not os.path.exists(result[0]):
-            print(f"❌ Audio file does not exist at path: {result[0]}")
-            return Div(
-                P(f"Audio file not found on disk: {os.path.basename(result[0])}"),
-                cls="alert alert-error"
-            )
-        
-        # Log the file path we're serving
-        print(f"✅ Serving audio file: {result[0]}")
-        
-        # Serve the actual file
-        return FileResponse(
-            result[0], 
-            media_type="audio/wav",
-            filename=f"podcast_{injection_id}.wav"
-        )
-
-    @rt("/generating/{injection_id}")
-    def generating_podcast(injection_id: str):
-        """A simpler page with basic HTMX SSE debugging"""
-        # Add the animation style
-        animation_style = Style("""
-        .animated-bg {
-            background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab);
-            background-size: 400% 400%;
-            animation: gradient 15s ease infinite;
-            height: 100vh;
-        }
-        
-        @keyframes gradient {
-            0% { background-position: 0% 50%; }
-            50% { background-position: 100% 50%; }
-            100% { background-position: 0% 50%; }
-        }
-        """)
-        
-        # Add debug helper to show raw SSE messages
-        debug_script = Script("""
-        // Debug helper that displays all SSE messages
-        document.addEventListener('DOMContentLoaded', function() {
-            console.log('Setting up SSE debug helper');
-            
-            // Create a debug container
-            const debugContainer = document.getElementById('debug-container');
-            
-            // Log all SSE events to console and display
-            document.addEventListener('htmx:sseMessage', function(event) {
-                console.log('SSE event received:', event.detail);
-                
-                // Add to debug container
-                const debugItem = document.createElement('div');
-                debugItem.classList.add('my-2', 'p-2', 'bg-black', 'bg-opacity-40', 'rounded');
-                
-                const eventType = document.createElement('div');
-                eventType.classList.add('text-yellow-400', 'font-bold');
-                eventType.textContent = 'Event: ' + event.detail.name;
-                
-                const eventData = document.createElement('div');
-                eventData.classList.add('text-green-400', 'font-mono', 'text-sm', 'whitespace-pre-wrap');
-                eventData.textContent = event.detail.data;
-                
-                debugItem.appendChild(eventType);
-                debugItem.appendChild(eventData);
-                debugContainer.appendChild(debugItem);
-            });
-            
-            // Open EventSource directly to debug
-            const evtSource = new EventSource('/podcast-updates-debug/' + document.getElementById('injection-id').textContent);
-            
-            evtSource.onmessage = function(event) {
-                console.log('Raw SSE message:', event.data);
-                
-                // Add to debug container
-                const debugItem = document.createElement('div');
-                debugItem.classList.add('my-2', 'p-2', 'bg-black', 'bg-opacity-40', 'rounded');
-                
-                const rawData = document.createElement('div');
-                rawData.classList.add('text-blue-400', 'font-mono', 'text-sm', 'whitespace-pre-wrap');
-                rawData.textContent = 'Raw: ' + event.data;
-                
-                debugItem.appendChild(rawData);
-                debugContainer.appendChild(debugItem);
-            };
-            
-            evtSource.onerror = function(err) {
-                console.error('EventSource error:', err);
-                const debugItem = document.createElement('div');
-                debugItem.classList.add('my-2', 'p-2', 'bg-black', 'bg-opacity-40', 'rounded');
-                debugItem.innerHTML = '<div class="text-red-500 font-bold">EventSource Error</div>';
-                debugContainer.appendChild(debugItem);
-            };
-        });
-        """)
-        
-        # Check database for initial status
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT status, processing_notes FROM injections WHERE id = ?", 
-            (injection_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        
-        initial_status = "pending"
-        initial_notes = "Initializing podcast generation..."
-        
-        if result:
-            initial_status = result[0]
-            if result[1]:
-                initial_notes = result[1]
-        
-        return Title("Podcast Generator Debug"), Main(
-            animation_style,
-            debug_script,
-            Div(
-                H1("Podcast Generator with HTMX SSE Debugging", cls="text-2xl font-bold text-center text-white mb-4"),
-                
-                # Basic info
-                Div(
-                    H2("Podcast Information", cls="text-xl font-bold text-center text-white mb-2"),
-                    P(f"Injection ID: ", Span(injection_id, id="injection-id"), cls="text-center text-white"),
-                    P(f"Initial Status: {initial_status}", cls="text-center text-white"),
-                    P(f"Initial Notes: {initial_notes}", cls="text-center text-white"),
-                    cls="mb-6 p-4 bg-black bg-opacity-20 rounded-lg"
-                ),
-                
-                # HTMX SSE simple status display
-                Div(
-                    H2("HTMX SSE Status Updates", cls="text-xl font-bold text-center text-white mb-2"),
-                    Div(
-                        P("Current Status: ", Span("Waiting for updates...", id="status-text"), 
-                        cls="text-center text-white"),
-                        P("Notes: ", Span("", id="notes-text"), cls="text-center text-white"),
-                        hx_ext="sse",
-                        sse_connect=f"/podcast-updates-simple/{injection_id}",
-                        sse_swap="message",
-                        cls="p-4 bg-black bg-opacity-40 rounded-lg"
-                    ),
-                    cls="mb-6"
-                ),
-                
-                # Audio container - direct implementation
-                Div(
-                    H2("Audio Player (HTMX SSE)", cls="text-xl font-bold text-center text-white mb-2"),
-                    Div(
-                        P("Waiting for audio...", id="audio-container"),
-                        hx_ext="sse",
-                        sse_connect=f"/podcast-updates-simple/{injection_id}",
-                        sse_swap="audio",
-                        cls="p-4 bg-black bg-opacity-40 rounded-lg"
-                    ),
-                    cls="mb-6"
-                ),
-                
-                # Raw debug output
-                Div(
-                    H2("Raw SSE Messages", cls="text-xl font-bold text-center text-white mb-2"),
-                    Div(
-                        id="debug-container",
-                        cls="max-h-80 overflow-y-auto p-4 bg-black bg-opacity-40 rounded-lg"
-                    ),
-                    cls="mb-6"
-                ),
-                
-                A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
-                
-                cls="container mx-auto px-4 py-8 max-w-3xl"
-            ),
-            cls="animated-bg min-h-screen"
         )
 
     @rt("/podcast-updates-simple/{injection_id}")
@@ -925,13 +1174,13 @@ def serve():
     async def check_status(injection_id: str):
         """Direct status page that redirects to the generating page with SSE updates"""
         from starlette.responses import RedirectResponse
-        return RedirectResponse(f"/generating/{injection_id}", status_code=303)
+        return RedirectResponse(f"/generating-fixed/{injection_id}", status_code=303)
     
     @rt("/status-redirect")
     def status_redirect(injection_id: str):
-        """Redirect to the status page for an ID"""
+        """Redirect to the fixed generating page for an ID"""
         from starlette.responses import RedirectResponse
-        return RedirectResponse(f"/generating/{injection_id}")
+        return RedirectResponse(f"/generating-fixed/{injection_id}")
 
     @rt("/update-schema")
     def update_schema():
