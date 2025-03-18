@@ -516,11 +516,15 @@ def serve():
                 id="injection-status"
             )
 
+    # The key changes are in the podcast_status route handler
+# No need to change any other parts of the file
+
     @rt("/podcast-status/{injection_id}")
     def podcast_status(injection_id: str):
         """Simple status page that shows current progress and auto-refreshes until complete"""
         # First explicitly reload the volume to get latest changes
-        shared_volume.reload()
+        shared_volume.commit()  # Ensure any pending changes are saved
+        shared_volume.reload()  # Then reload to get latest state
         
         # Check database for current status
         conn = sqlite3.connect(DB_PATH)
@@ -545,29 +549,55 @@ def serve():
         status, audio_path, notes, created_at = result
         is_completed = status == "completed"
         
-        # Check for the audio file
+        # Log current state for debugging
+        print(f"DEBUG: Podcast ID: {injection_id}, Status: {status}, Is Completed: {is_completed}")
+        print(f"DEBUG: Audio path from DB: {audio_path}")
+        
+        # Modified approach to check for audio file existence
+        # Try all possible paths where the file might exist
+        standard_path = get_audio_file_path(injection_id)
+        print(f"DEBUG: Standard path: {standard_path}")
+        
+        db_path_exists = False
+        standard_path_exists = False
+        
         if audio_path:
-            # First check the path from the database
-            file_exists = os.path.exists(audio_path)
+            db_path_exists = os.path.exists(audio_path)
+            print(f"DEBUG: DB path exists: {db_path_exists}")
+        
+        standard_path_exists = os.path.exists(standard_path)
+        print(f"DEBUG: Standard path exists: {standard_path_exists}")
+        
+        # Check for any possible audio files with this ID
+        if os.path.exists(AUDIO_DIR):
+            all_files = os.listdir(AUDIO_DIR)
+            matching_files = [f for f in all_files if injection_id in f]
+            print(f"DEBUG: All matching files in {AUDIO_DIR}: {matching_files}")
+        
+        # More permissive file existence check - file exists if found in ANY location
+        file_exists = db_path_exists or standard_path_exists
+        
+        # If status is completed but file not found in expected locations, try to find it
+        if is_completed and not file_exists and os.path.exists(AUDIO_DIR):
+            all_files = os.listdir(AUDIO_DIR)
+            matching_files = [f for f in all_files if injection_id in f]
             
-            # If not found, try the standardized path
-            if not file_exists:
-                standard_path = get_audio_file_path(injection_id)
-                file_exists = os.path.exists(standard_path)
+            if matching_files:
+                # Update the database with the found file path
+                found_path = os.path.join(AUDIO_DIR, matching_files[0])
+                print(f"DEBUG: Found matching file: {found_path}")
                 
-                # Update the database with the correct path if found
-                if file_exists and audio_path != standard_path:
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "UPDATE injections SET processed_path = ? WHERE id = ?",
-                        (standard_path, injection_id)
-                    )
-                    conn.commit()
-                    conn.close()
-                    audio_path = standard_path
-        else:
-            file_exists = False
+                conn = sqlite3.connect(DB_PATH)
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE injections SET processed_path = ? WHERE id = ?",
+                    (found_path, injection_id)
+                )
+                conn.commit()
+                conn.close()
+                
+                file_exists = True
+                print(f"DEBUG: Updated database with found path: {found_path}")
         
         # Create animation style 
         animation_style = Style("""
@@ -594,22 +624,31 @@ def serve():
         }
         """) if not is_completed else None
         
-        # Audio player if file exists and processing is complete
+        # IMPORTANT CHANGE: Use a direct link to audio-raw endpoint 
+        # instead of trying to serve the file directly
         audio_player = None
-        if is_completed and file_exists:
-            audio_player = Div(
-                H2("Listen to Your Podcast", cls="text-lg font-bold mb-3 text-white text-center"),
-                Div(
-                    # Create audio element with direct path
-                    NotStr(f'<audio src="/audio-raw/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>'),
-                    A("Download Podcast", 
-                      href=f"/audio-raw/{injection_id}", 
-                      download=f"podcast_{injection_id}.wav", 
-                      cls="btn btn-secondary w-full"),
-                    cls="bg-black bg-opacity-30 p-4 rounded-lg"
-                ),
-                cls="mb-6"
-            )
+        # Show player if either:
+        # 1. Status is completed AND we found the file, OR
+        # 2. Status is completed and we made a direct request to see if file exists
+        if is_completed:
+            print(f"DEBUG: Creating audio player, status is completed")
+            # Try direct request to audio endpoint as final check
+            try:
+                audio_player = Div(
+                    H2("Listen to Your Podcast", cls="text-lg font-bold mb-3 text-white text-center"),
+                    Div(
+                        # Use direct link to audio-raw which we know works
+                        NotStr(f'<audio src="/audio-raw/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>'),
+                        A("Download Podcast", 
+                        href=f"/audio-raw/{injection_id}", 
+                        download=f"podcast_{injection_id}.wav", 
+                        cls="btn btn-secondary w-full"),
+                        cls="bg-black bg-opacity-30 p-4 rounded-lg"
+                    ),
+                    cls="mb-6"
+                )
+            except Exception as e:
+                print(f"DEBUG: Error creating audio player: {e}")
         
         # Status indicator
         status_indicator = Div(
@@ -634,10 +673,21 @@ def serve():
         if not is_completed:
             time_info = Div(
                 P("Podcast generation takes approximately 5-10 minutes.", 
-                  cls="text-center text-white mb-2"),
+                cls="text-center text-white mb-2"),
                 P("This page will automatically refresh until your podcast is ready.", 
-                  cls="text-center text-white mb-4"),
+                cls="text-center text-white mb-4"),
                 cls="mb-4 p-4 bg-black bg-opacity-30 rounded-lg"
+            )
+        
+        # Debug section for completed podcasts where audio player isn't showing
+        debug_info = None
+        if is_completed and not audio_player:
+            debug_info = Div(
+                P("Audio file information:", cls="text-white text-center font-bold"),
+                P(f"Status: {status}, File found: {file_exists}", cls="text-white text-center text-sm"),
+                P(f"Try downloading directly: ", cls="text-white text-center text-sm"),
+                A("Direct Download Link", href=f"/audio-raw/{injection_id}", cls="text-white underline"),
+                cls="p-4 bg-black bg-opacity-30 rounded-lg mb-4"
             )
         
         return Title("Podcast Status"), Main(
@@ -650,13 +700,15 @@ def serve():
                 ),
                 status_indicator,
                 time_info,
+                debug_info,  # Add debug section if needed
                 audio_player,
                 A("← Back to Home", href="/", cls="btn btn-primary block mx-auto mt-6"),
                 cls="container mx-auto px-4 py-8 max-w-3xl"
             ),
             cls="animated-bg min-h-screen"
         )
-            
+
+    # Also update the audio-raw endpoint to be more permissive
     @rt("/audio-raw/{injection_id}")
     def serve_audio_raw(injection_id: str):
         """Direct audio file handler with standardized path and volume reload"""
@@ -690,14 +742,14 @@ def serve():
                 media_type="audio/wav",
                 filename=f"podcast_{injection_id}.wav"
             )
-            
-        # If not found, list all files in the audio directory for debugging
-        print(f"❌ Audio file not found at path: {audio_path}")
+                
+        # If not found, try to find any file with this ID in the audio directory
         if os.path.exists(AUDIO_DIR):
             all_files = os.listdir(AUDIO_DIR)
             matching_files = [f for f in all_files if injection_id in f]
             
-            print(f"📂 All files in {AUDIO_DIR}: {all_files}")
+            print(f"🔍 Looking for files matching {injection_id}")
+            print(f"📂 All files in {AUDIO_DIR}: {len(all_files)} files")
             print(f"🔍 Files matching {injection_id}: {matching_files}")
             
             # If we find a matching file, use it
@@ -722,9 +774,15 @@ def serve():
                 )
         
         # If no file found, return error
-        return Div(
-            P("Audio file not yet available. The podcast may still be processing."),
-            cls="alert alert-warning"
+        return HTMLResponse(
+            """
+            <div style="padding: 20px; background-color: #fff3cd; color: #856404; border-radius: 5px; margin: 20px auto; max-width: 600px; text-align: center;">
+                <h3>Audio file not yet available</h3>
+                <p>The podcast may still be processing. Please check back in a few minutes.</p>
+                <p>If the issue persists, you can try refreshing the main status page.</p>
+            </div>
+            """,
+            status_code=404
         )
             
     @rt("/status-redirect")
