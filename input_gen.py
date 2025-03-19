@@ -10,7 +10,7 @@ from fasthtml.common import *
 # Core PDF support - required
 import PyPDF2
 
-# Optional format support
+# Optional format support 
 import whisper
 
 from langchain_community.document_loaders import WebBaseLoader
