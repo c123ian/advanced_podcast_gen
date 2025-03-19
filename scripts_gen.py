@@ -298,7 +298,7 @@ except modal.exception.NotFoundError:
 
 @app.function(
     image=llama_image if LLAMA_DIR else common_image,
-    gpu=modal.gpu.A100(count=1, size="80GB") if LLAMA_DIR else modal.gpu.T4(count=1),
+    gpu=modal.gpu.A10G(count=1),
     container_idle_timeout=10 * 60,
     timeout=24 * 60 * 60,
     volumes={LLAMA_DIR: llm_volume, "/data": shared_volume} if LLAMA_DIR else {"/data": shared_volume},
