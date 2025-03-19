@@ -237,7 +237,7 @@ app = modal.App("content_injection")
 @app.function(
     image=common_image,
     volumes={"/data": shared_volume},
-    cpu=8.0,
+    cpu=2.0,
     timeout=3600
 )
 @modal.asgi_app()
