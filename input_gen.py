@@ -6,11 +6,10 @@ from typing import Optional
 import torch
 import json
 import base64
+import asyncio
 from fasthtml.common import *
-# Core PDF support - required
 import PyPDF2
 
-# Optional format support 
 import whisper
 
 from langchain_community.document_loaders import WebBaseLoader
@@ -182,10 +181,8 @@ class IngestorFactory:
             return None
 
 
-# Create Modal App
-app = modal.App("content_injection")
 
-# Directories
+# Define directories
 UPLOAD_DIR = "/data/uploads_truncate"
 OUTPUT_DIR = "/data/processed_truncate"
 DB_PATH = "/data/injections_truncate.db"
@@ -196,50 +193,10 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-# Setup Database
-def setup_database(db_path: str):
-    """Initialize SQLite database for tracking injections"""
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS injections (
-            id TEXT PRIMARY KEY,
-            original_filename TEXT NOT NULL,
-            input_type TEXT NOT NULL,
-            processed_path TEXT,
-            status TEXT DEFAULT 'pending',
-            content_length INTEGER,
-            processing_notes TEXT,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    return conn
-
-# Determine Input Type
-def get_input_type(filename: str) -> str:
-    """Classifies input type based on filename or URL"""
-    lower_filename = filename.lower()
-    if lower_filename.endswith('.pdf'):
-        return 'pdf'
-    elif lower_filename.endswith(('.mp3', '.wav', '.m4a', '.flac')):
-        return 'audio'
-    elif lower_filename.startswith(('http://', 'https://')):
-        return 'website'
-    elif lower_filename.endswith(('.txt', '.md')):
-        return 'text'
-    else:
-        raise ValueError(f"Unsupported file type: {filename}")
-
-# Process Uploaded Content
-def process_content(source_path: str, input_type: str, max_chars: int = MAX_CONTENT_CHARS) -> Optional[str]:
-    """Processes content using the appropriate ingestor"""
-    ingestor = IngestorFactory.get_ingestor(input_type)
-    if not ingestor:
-        print(f"❌ No ingestor found for type: {input_type}")
-        return None
-    return ingestor.extract_text(source_path, max_chars)
+# Function to get standardized audio file path
+def get_audio_file_path(injection_id):
+    """Returns a standardized path for audio files based on injection_id"""
+    return os.path.join(AUDIO_DIR, f"podcast_{injection_id}.wav")
 
 # Function to update injection status
 def update_injection_status(injection_id, status, notes=None):
@@ -273,12 +230,10 @@ def update_injection_status(injection_id, status, notes=None):
     except Exception as e:
         print(f"⚠️ Error updating injection status: {e}")
 
-# Function to get standardized audio file path
-def get_audio_file_path(injection_id):
-    """Returns a standardized path for audio files based on injection_id"""
-    return os.path.join(AUDIO_DIR, f"podcast_{injection_id}.wav")
+# Create Modal App
+app = modal.App("content_injection")
 
-# Start Modal App with ASGI
+# Main FastHTML Server with defined routes
 @app.function(
     image=common_image,
     volumes={"/data": shared_volume},
@@ -288,8 +243,7 @@ def get_audio_file_path(injection_id):
 @modal.asgi_app()
 def serve():
     """Main FastHTML Server"""
-    conn = setup_database(DB_PATH)
-    # Add DaisyUI, Tailwind CSS, and HTMX SSE extension to headers
+    # Set up the FastHTML app with required headers
     fasthtml_app, rt = fast_app(
         hdrs=(
             Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/daisyui@3.9.2/dist/full.css"),
@@ -297,7 +251,140 @@ def serve():
             Script(src="https://unpkg.com/htmx.org@1.9.10"),
         )
     )
+    
+    # Setup Database
+    def setup_database(db_path: str):
+        """Initialize SQLite database for tracking injections"""
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS injections (
+                id TEXT PRIMARY KEY,
+                original_filename TEXT NOT NULL,
+                input_type TEXT NOT NULL,
+                processed_path TEXT,
+                status TEXT DEFAULT 'pending',
+                content_length INTEGER,
+                processing_notes TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+        return conn
 
+    # Determine Input Type
+    def get_input_type(filename: str) -> str:
+        """Classifies input type based on filename or URL"""
+        lower_filename = filename.lower()
+        if lower_filename.endswith('.pdf'):
+            return 'pdf'
+        elif lower_filename.endswith(('.mp3', '.wav', '.m4a', '.flac')):
+            return 'audio'
+        elif lower_filename.startswith(('http://', 'https://')):
+            return 'website'
+        elif lower_filename.endswith(('.txt', '.md')):
+            return 'text'
+        else:
+            raise ValueError(f"Unsupported file type: {filename}")
+
+    # Process Uploaded Content
+    def process_content(source_path: str, input_type: str, max_chars: int = 45000) -> Optional[str]:
+        """Processes content using the appropriate ingestor"""
+        ingestor = IngestorFactory.get_ingestor(input_type)
+        if not ingestor:
+            print(f"❌ No ingestor found for type: {input_type}")
+            return None
+        return ingestor.extract_text(source_path, max_chars)
+    
+
+    @rt("/inject", methods=["POST"])
+    async def inject_content(request):
+        """Handles content ingestion and starts the podcast generation pipeline."""
+        form = await request.form()
+        injection_id = uuid.uuid4().hex
+
+        try:
+            # Handle File Upload or URL
+            if "content" in form and form["content"].filename:
+                file_field = form["content"]
+                original_filename = file_field.filename
+                input_type = get_input_type(original_filename)
+                save_path = os.path.join(UPLOAD_DIR, f"upload_{injection_id}{os.path.splitext(original_filename)[1]}")
+                content = await file_field.read()
+                with open(save_path, "wb") as f:
+                    f.write(content)
+            elif "url" in form and form["url"].strip():
+                url = form["url"].strip()
+                input_type = get_input_type(url)
+                save_path = url
+                original_filename = url
+            else:
+                return Div(
+                    Div(
+                        P("⚠️ Please select a file or provide a URL."),
+                        cls="alert alert-warning"
+                    ),
+                    id="injection-status"
+                )
+
+            # Extract Text Content
+            processed_text = process_content(save_path, input_type)
+            if not processed_text:
+                return Div(
+                    Div(
+                        P("❌ Failed to process content"),
+                        cls="alert alert-error"
+                    ),
+                    id="injection-status"
+                )
+
+            # Set the standardized audio file path
+            audio_file_path = get_audio_file_path(injection_id)
+
+            # Insert record into database with content size info and initial status
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO injections 
+                (id, original_filename, input_type, status, content_length, processing_notes, processed_path) 
+                VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (injection_id, original_filename, input_type, "pending", 
+                len(processed_text), f"Content ingested: {len(processed_text)} chars", audio_file_path)
+            )
+            conn.commit()
+            conn.close()
+
+            # Update status to show script generation starting
+            update_injection_status(injection_id, "processing", "Starting script generation...")
+
+            # Proper function sequence with correctly coupled inputs/outputs
+            print("🚀 Kicking off script generation...")
+            # First run script generation and get the result
+            script_data = generate_script.remote(processed_text)
+            
+            # Update status to show audio generation starting
+            update_injection_status(injection_id, "processing", "Script generated. Starting audio generation...")
+            
+            # Then pass that directly to audio generation
+            print("🔊 Kicking off audio generation...")
+            generate_audio.spawn(script_data, injection_id)
+            
+            # Redirect to the podcast status page
+            return RedirectResponse(f"/podcast-status/{injection_id}", status_code=303)
+
+        except Exception as e:
+            return Div(
+                Div(
+                    P(f"⚠️ Error processing content: {str(e)}"),
+                    cls="alert alert-error"
+                ),
+                id="injection-status"
+            )
+
+    #################################################
+    # Homepage Route - Upload Form
+    #################################################
     @rt("/")
     def homepage():
         """Render upload form with status checker"""
@@ -347,7 +434,7 @@ def serve():
         
         # Content limits information
         content_info = Div(
-            P(f"Maximum content length: {MAX_CONTENT_CHARS//1000}K characters (longer content will be truncated)",
+            P(f"Maximum content length: {45000//1000}K characters (longer content will be truncated)",
               cls="text-sm text-center opacity-70 mt-2")
         )
         
@@ -431,102 +518,79 @@ def serve():
             ),
             cls="min-h-screen bg-base-100"
         )
+    
+    
 
-    @rt("/inject", methods=["POST"])
-    async def inject_content(request):
-        """Handles content ingestion and starts the podcast generation pipeline."""
-        form = await request.form()
-        injection_id = uuid.uuid4().hex
-
-        try:
-            # Handle File Upload or URL
-            if "content" in form and form["content"].filename:
-                file_field = form["content"]
-                original_filename = file_field.filename
-                input_type = get_input_type(original_filename)
-                save_path = os.path.join(UPLOAD_DIR, f"upload_{injection_id}{os.path.splitext(original_filename)[1]}")
-                content = await file_field.read()
-                with open(save_path, "wb") as f:
-                    f.write(content)
-            elif "url" in form and form["url"].strip():
-                url = form["url"].strip()
-                input_type = get_input_type(url)
-                save_path = url
-                original_filename = url
-            else:
-                return Div(
-                    Div(
-                        P("⚠️ Please select a file or provide a URL."),
-                        cls="alert alert-warning"
-                    ),
-                    id="injection-status"
-                )
-
-            # Extract Text Content
-            processed_text = process_content(save_path, input_type)
-            if not processed_text:
-                return Div(
-                    Div(
-                        P("❌ Failed to process content"),
-                        cls="alert alert-error"
-                    ),
-                    id="injection-status"
-                )
-
-            # Set the standardized audio file path
-            audio_file_path = get_audio_file_path(injection_id)
-
-            # Insert record into database with content size info and initial status
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO injections 
-                   (id, original_filename, input_type, status, content_length, processing_notes, processed_path) 
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (injection_id, original_filename, input_type, "pending", 
-                 len(processed_text), f"Content ingested: {len(processed_text)} chars", audio_file_path)
-            )
-            conn.commit()
-            conn.close()
-
-            # Update status to show script generation starting
-            update_injection_status(injection_id, "processing", "Starting script generation...")
-
-            # Proper function sequence with correctly coupled inputs/outputs
-            print("🚀 Kicking off script generation...")
-            # First run script generation and get the result
-            script_data = generate_script.remote(processed_text)
-            
-            # Update status to show audio generation starting
-            update_injection_status(injection_id, "processing", "Script generated. Starting audio generation...")
-            
-            # Then pass that directly to audio generation
-            print("🔊 Kicking off audio generation...")
-            generate_audio.spawn(script_data, injection_id)
-            
-            # Redirect to the podcast status page
-            return RedirectResponse(f"/podcast-status/{injection_id}", status_code=303)
-
-        except Exception as e:
-            return Div(
-                Div(
-                    P(f"⚠️ Error processing content: {str(e)}"),
-                    cls="alert alert-error"
-                ),
-                id="injection-status"
-            )
-
-    # The key changes are in the podcast_status route handler
-# No need to change any other parts of the file
-
-    @rt("/podcast-status/{injection_id}")
-    def podcast_status(injection_id: str):
-        """Simple status page that shows current progress and auto-refreshes until complete"""
-        # First explicitly reload the volume to get latest changes
-        shared_volume.commit()  # Ensure any pending changes are saved
-        shared_volume.reload()  # Then reload to get latest state
+    #################################################
+    # Status JSON API Endpoint for Lightweight Polling
+    #################################################
+    @rt("/podcast-status-api/{injection_id}")
+    def podcast_status_api(injection_id: str):
+        """API endpoint that returns just the status data in JSON format"""
+        # Reload volume to get latest
+        shared_volume.reload()
         
         # Check database for current status
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT status, processed_path, processing_notes, created_at FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if not result:
+            return JSONResponse({"status": "error", "message": "Podcast not found"})
+        
+        status, audio_path, notes, created_at = result
+        is_completed = status == "completed"
+        
+        # Check if audio file exists at standard location
+        audio_exists = False
+        if is_completed:
+            standard_path = get_audio_file_path(injection_id)
+            audio_exists = os.path.exists(standard_path) or (audio_path and os.path.exists(audio_path))
+        
+            # If we can't find the audio file but status is completed, check the audio dir for matching files
+            if not audio_exists and os.path.exists(AUDIO_DIR):
+                all_files = os.listdir(AUDIO_DIR)
+                matching_files = [f for f in all_files if injection_id in f]
+                
+                if matching_files:
+                    audio_exists = True
+                    # Update the database with the found file path
+                    found_path = os.path.join(AUDIO_DIR, matching_files[0])
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE injections SET processed_path = ? WHERE id = ?",
+                            (found_path, injection_id)
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception as e:
+                        print(f"Error updating database with found path: {e}")
+        
+        return JSONResponse({
+            "status": status,
+            "notes": notes,
+            "is_completed": is_completed,
+            "audio_exists": audio_exists,
+            "timestamp": created_at
+        })
+
+    #################################################
+    # Status Page with Hybrid Polling & Reload Logic
+    #################################################
+    @rt("/podcast-status/{injection_id}")
+    def podcast_status(injection_id: str):
+        """Status page that polls efficiently and reloads once when ready"""
+        # First explicitly reload the volume to get latest changes
+        shared_volume.reload()
+        
+        # Initial database query for the first render
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         cursor.execute(
@@ -549,55 +613,61 @@ def serve():
         status, audio_path, notes, created_at = result
         is_completed = status == "completed"
         
-        # Log current state for debugging
-        print(f"DEBUG: Podcast ID: {injection_id}, Status: {status}, Is Completed: {is_completed}")
-        print(f"DEBUG: Audio path from DB: {audio_path}")
+        # Check if audio file exists at standard location
+        audio_exists = False
+        file_path = None
         
-        # Modified approach to check for audio file existence
-        # Try all possible paths where the file might exist
-        standard_path = get_audio_file_path(injection_id)
-        print(f"DEBUG: Standard path: {standard_path}")
-        
-        db_path_exists = False
-        standard_path_exists = False
-        
-        if audio_path:
-            db_path_exists = os.path.exists(audio_path)
-            print(f"DEBUG: DB path exists: {db_path_exists}")
-        
-        standard_path_exists = os.path.exists(standard_path)
-        print(f"DEBUG: Standard path exists: {standard_path_exists}")
-        
-        # Check for any possible audio files with this ID
-        if os.path.exists(AUDIO_DIR):
-            all_files = os.listdir(AUDIO_DIR)
-            matching_files = [f for f in all_files if injection_id in f]
-            print(f"DEBUG: All matching files in {AUDIO_DIR}: {matching_files}")
-        
-        # More permissive file existence check - file exists if found in ANY location
-        file_exists = db_path_exists or standard_path_exists
-        
-        # If status is completed but file not found in expected locations, try to find it
-        if is_completed and not file_exists and os.path.exists(AUDIO_DIR):
-            all_files = os.listdir(AUDIO_DIR)
-            matching_files = [f for f in all_files if injection_id in f]
+        if is_completed:
+            # Try the path from database first
+            if audio_path and os.path.exists(audio_path):
+                audio_exists = True
+                file_path = audio_path
             
-            if matching_files:
-                # Update the database with the found file path
-                found_path = os.path.join(AUDIO_DIR, matching_files[0])
-                print(f"DEBUG: Found matching file: {found_path}")
+            # Then try standard path
+            standard_path = get_audio_file_path(injection_id)
+            if os.path.exists(standard_path):
+                audio_exists = True
+                file_path = standard_path
                 
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE injections SET processed_path = ? WHERE id = ?",
-                    (found_path, injection_id)
-                )
-                conn.commit()
-                conn.close()
+            # If still no file found, search directory
+            if not audio_exists and os.path.exists(AUDIO_DIR):
+                all_files = os.listdir(AUDIO_DIR)
+                matching_files = [f for f in all_files if injection_id in f]
                 
-                file_exists = True
-                print(f"DEBUG: Updated database with found path: {found_path}")
+                if matching_files:
+                    audio_exists = True
+                    file_path = os.path.join(AUDIO_DIR, matching_files[0])
+                    
+                    # Update database if found
+                    try:
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            "UPDATE injections SET processed_path = ? WHERE id = ?",
+                            (file_path, injection_id)
+                        )
+                        conn.commit()
+                        conn.close()
+                    except Exception as e:
+                        print(f"Error updating database with found path: {e}")
+            
+        # If we're receiving a request and status is already completed with audio,
+        # assume this is the post-reload page view where we want to show the player
+        audio_player = None
+        if is_completed and audio_exists:
+            audio_player = Div(
+                H2("Listen to Your Podcast", cls="text-lg font-bold mb-3 text-white text-center"),
+                Div(
+                    NotStr(f'<audio src="/audio-raw/{injection_id}" controls autoplay class="w-full rounded-lg shadow mb-4"></audio>'),
+                    A("Download Podcast", 
+                      href=f"/audio-raw/{injection_id}", 
+                      download=f"podcast_{injection_id}.wav", 
+                      cls="btn btn-secondary w-full"),
+                    cls="bg-black bg-opacity-30 p-4 rounded-lg"
+                ),
+                id="audio-player",
+                cls="mb-6"
+            )
         
         # Create animation style 
         animation_style = Style("""
@@ -615,100 +685,175 @@ def serve():
         }
         """)
         
-        # Auto-refresh script - only needed if not completed
-        refresh_script = Script("""
-        if (!document.getElementById('completed-indicator')) {
-            setTimeout(function() {
-                window.location.reload();
-            }, 5000);
-        }
-        """) if not is_completed else None
+        # Calculate how long the process has been running for smart backoff
+        import datetime
         
-        # IMPORTANT CHANGE: Use a direct link to audio-raw endpoint 
-        # instead of trying to serve the file directly
-        audio_player = None
-        # Show player if either:
-        # 1. Status is completed AND we found the file, OR
-        # 2. Status is completed and we made a direct request to see if file exists
-        if is_completed:
-            print(f"DEBUG: Creating audio player, status is completed")
-            # Try direct request to audio endpoint as final check
+        # Convert created_at from string to datetime if needed
+        if isinstance(created_at, str):
             try:
-                audio_player = Div(
-                    H2("Listen to Your Podcast", cls="text-lg font-bold mb-3 text-white text-center"),
-                    Div(
-                        # Use direct link to audio-raw which we know works
-                        NotStr(f'<audio src="/audio-raw/{injection_id}" controls class="w-full rounded-lg shadow mb-4"></audio>'),
-                        A("Download Podcast", 
-                        href=f"/audio-raw/{injection_id}", 
-                        download=f"podcast_{injection_id}.wav", 
-                        cls="btn btn-secondary w-full"),
-                        cls="bg-black bg-opacity-30 p-4 rounded-lg"
-                    ),
-                    cls="mb-6"
-                )
-            except Exception as e:
-                print(f"DEBUG: Error creating audio player: {e}")
+                created_at = datetime.datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                created_at = datetime.datetime.now() - datetime.timedelta(minutes=1)
         
-        # Status indicator
+        # Calculate elapsed time
+        now = datetime.datetime.now()
+        elapsed_seconds = (now - created_at).total_seconds()
+        
+        # Determine polling interval based on elapsed time
+        # More frequent at the start, less frequent as time passes
+        poll_interval = 3000  # 3 seconds (in milliseconds)
+        
+        if elapsed_seconds > 60:  # After 1 minute
+            poll_interval = 5000  # 5 seconds
+        if elapsed_seconds > 120:  # After 2 minutes
+            poll_interval = 10000  # 10 seconds
+        if elapsed_seconds > 300:  # After 5 minutes
+            poll_interval = 15000  # 15 seconds
+        
+        # Only include this script if not already completed with available audio
+        status_polling_script = Script(f"""
+        // Only set up polling if not already completed
+        const checkStatus = function() {{
+            fetch('/podcast-status-api/{injection_id}')
+                .then(response => response.json())
+                .then(data => {{
+                    console.log('Status update:', data);
+                    
+                    // Update status display
+                    document.getElementById('status-text').innerText = 'Status: ' + data.status;
+                    document.getElementById('status-notes').innerText = data.notes || 'Processing...';
+                    
+                    // Calculate progress percentage
+                    let createdAt = data.timestamp;
+                    if (typeof createdAt === 'string') {{
+                        createdAt = new Date(createdAt).getTime();
+                    }} else {{
+                        createdAt = new Date().getTime() - 60000; // Fallback: 1 minute ago
+                    }}
+                    
+                    const elapsed = (Date.now() - createdAt) / 1000; // seconds
+                    const totalEstimated = 7 * 60; // 7 minutes in seconds
+                    const progressPct = Math.min(95, Math.floor((elapsed / totalEstimated) * 100));
+                    
+                    // Update progress bar
+                    const progressBar = document.getElementById('progress-bar');
+                    if (progressBar) progressBar.style.width = progressPct + '%';
+                    
+                    // Update time estimate
+                    const elapsedMin = Math.floor(elapsed / 60);
+                    const elapsedSec = Math.floor(elapsed % 60);
+                    const remainingMin = Math.max(0, Math.floor((totalEstimated - elapsed) / 60));
+                    const remainingSec = Math.max(0, Math.floor((totalEstimated - elapsed) % 60));
+                    
+                    const timeInfo = document.getElementById('time-estimate');
+                    if (timeInfo) {{
+                        timeInfo.innerText = `Elapsed: ${{elapsedMin}}m ${{elapsedSec}}s | Est. remaining: ${{remainingMin}}m ${{remainingSec}}s`;
+                    }}
+                    
+                    // If podcast is complete and audio exists, reload the page once
+                    if (data.is_completed && data.audio_exists) {{
+                        console.log('Podcast is ready! Reloading page to show player...');
+                        
+                        // Show a brief message before reload
+                        const statusIcon = document.getElementById('status-icon');
+                        if (statusIcon) statusIcon.innerHTML = '<span class="text-4xl">✓</span>';
+                        
+                        document.getElementById('status-notes').innerText = 'Podcast is ready! Loading player...';
+                        
+                        // Brief delay then reload
+                        setTimeout(() => window.location.reload(), 1000);
+                        return; // Stop further polling
+                    }}
+                    
+                    // Continue polling if not complete
+                    if (!data.is_completed) {{
+                        setTimeout(checkStatus, {poll_interval});
+                    }}
+                }})
+                .catch(error => {{
+                    console.error('Error checking status:', error);
+                    // Continue polling even on error, but with longer interval
+                    setTimeout(checkStatus, {poll_interval * 2});
+                }});
+        }};
+        
+        // Start polling immediately (if not already completed)
+        if (!document.getElementById('completed-indicator')) {{
+            checkStatus();
+        }}
+        """) if not (is_completed and audio_exists) else None
+        
+        # Status indicator - different based on completed state
         status_indicator = Div(
+            # Status icon (checkmark or loading indicator)
             Div(
-                # Success icon or loading indicator
+                Span("✓", cls="text-4xl") if (is_completed and audio_exists) else NotStr('<div class="loading loading-dots loading-lg"></div>'),
+                cls="text-success mb-6 mx-auto",
+                id="status-icon"
+            ),
+            
+            # Status text
+            P(f"Status: {status}", cls="text-lg mb-2 text-center text-white", id="status-text"),
+            P(notes or "Processing in progress...", cls="text-sm mb-4 text-center text-white", id="status-notes"),
+            
+            # Progress bar and time estimate (only for in-progress)
+            Div(
                 Div(
-                    Span("✓", cls="text-4xl", id="completed-indicator") if is_completed else NotStr('<div class="loading loading-dots loading-lg"></div>'),
-                    cls="text-success mb-6 mx-auto"
+                    Div(
+                        cls="bg-blue-400 h-2.5 rounded-full", 
+                        style="width: 0%",
+                        id="progress-bar"
+                    ),
+                    cls="w-full bg-gray-700 rounded-full h-2.5 mb-2"
                 ),
-                
-                # Status text
-                P(f"Status: {status}", cls="text-lg mb-2 text-center text-white"),
-                P(notes or "Processing in progress...", cls="text-sm mb-4 text-center text-white"),
-                P(f"Podcast ID: {injection_id}", cls="font-mono text-sm mb-6 text-center text-white"),
-                
-                cls="p-6 bg-black bg-opacity-20 rounded-lg mb-6 text-center"
-            )
+                P(
+                    "Calculating time estimate...",
+                    cls="text-xs text-center text-white",
+                    id="time-estimate"
+                ),
+                cls="mt-4"
+            ) if not (is_completed and audio_exists) else None,
+            
+            # Add a completed indicator div if complete
+            Div(id="completed-indicator") if (is_completed and audio_exists) else None,
+            
+            id="status-section",
+            cls="p-6 bg-black bg-opacity-20 rounded-lg mb-6"
         )
         
-        # Expected time info
-        time_info = None
-        if not is_completed:
-            time_info = Div(
-                P("Podcast generation takes approximately 5-10 minutes.", 
-                cls="text-center text-white mb-2"),
-                P("This page will automatically refresh until your podcast is ready.", 
-                cls="text-center text-white mb-4"),
-                cls="mb-4 p-4 bg-black bg-opacity-30 rounded-lg"
-            )
+        # Expected time info - only show if not completed with audio
+        time_info = Div(
+            P("Podcast generation takes approximately 5-10 minutes.", 
+              cls="text-center text-white mb-2"),
+            P("This page will automatically update when your podcast is ready.", 
+              cls="text-center text-white mb-4"),
+            cls="mb-4 p-4 bg-black bg-opacity-30 rounded-lg",
+            id="time-info"
+        ) if not (is_completed and audio_exists) else None
         
-        # Debug section for completed podcasts where audio player isn't showing
-        debug_info = None
-        if is_completed and not audio_player:
-            debug_info = Div(
-                P("Audio file information:", cls="text-white text-center font-bold"),
-                P(f"Status: {status}, File found: {file_exists}", cls="text-white text-center text-sm"),
-                P(f"Try downloading directly: ", cls="text-white text-center text-sm"),
-                A("Direct Download Link", href=f"/audio-raw/{injection_id}", cls="text-white underline"),
-                cls="p-4 bg-black bg-opacity-30 rounded-lg mb-4"
-            )
-        
+        # Main page content
         return Title("Podcast Status"), Main(
             animation_style,
-            refresh_script,
+            status_polling_script,
             Div(
                 H1(
-                    "Your Podcast is Ready!" if is_completed else "Your Podcast is Being Generated",
+                    "Your Podcast is Ready!" if (is_completed and audio_exists) else "Your Podcast is Being Generated",
                     cls="text-3xl font-bold text-center text-white mb-6"
                 ),
                 status_indicator,
                 time_info,
-                debug_info,  # Add debug section if needed
-                audio_player,
+                audio_player,  # Only included if status is completed and audio exists
                 A("← Back to Home", href="/", cls="btn btn-primary block mx-auto mt-6"),
+                P(f"Podcast ID: {injection_id}", 
+                  cls="text-center text-white opacity-70 text-sm mt-4 font-mono"),
                 cls="container mx-auto px-4 py-8 max-w-3xl"
             ),
             cls="animated-bg min-h-screen"
         )
-
-    # Also update the audio-raw endpoint to be more permissive
+    
+    #################################################
+    # Audio File Serving Endpoint
+    #################################################
     @rt("/audio-raw/{injection_id}")
     def serve_audio_raw(injection_id: str):
         """Direct audio file handler with standardized path and volume reload"""
@@ -784,15 +929,14 @@ def serve():
             """,
             status_code=404
         )
-            
+    
+    #################################################
+    # Status Redirect Helper
+    #################################################
     @rt("/status-redirect")
     def status_redirect(injection_id: str):
         """Redirect to the podcast status page"""
         return RedirectResponse(f"/podcast-status/{injection_id}")
 
+    # Return the FastHTML app
     return fasthtml_app
-
-
-if __name__ == "__main__":
-    with modal.app.run():
-        serve()  # Starts the FastHTML server with the correct function references
