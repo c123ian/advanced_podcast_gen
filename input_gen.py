@@ -442,7 +442,8 @@ def serve():
         process_button = Button(
             "Process Content",
             cls="btn btn-primary w-full mt-4",
-            type="submit"
+            type="submit",
+            id="process-button"
         )
 
         # Add script to handle loading state
@@ -460,6 +461,7 @@ def serve():
                 }
             }
         });
+        
         document.addEventListener('htmx:afterRequest', function(evt) {
             if (evt.target.matches('form')) {
                 // Find the submit button
@@ -469,6 +471,23 @@ def serve():
                     btn.innerHTML = btn.dataset.originalText;
                     btn.disabled = false;
                 }
+            }
+        });
+        
+        // Fallback for non-HTMX form submissions
+        document.addEventListener('DOMContentLoaded', function() {
+            var uploadForm = document.getElementById('upload-form');
+            if (uploadForm) {
+                uploadForm.addEventListener('submit', function() {
+                    var btn = document.getElementById('process-button');
+                    if (btn) {
+                        // Save the original text
+                        btn.dataset.originalText = btn.textContent;
+                        // Replace with loading spinner
+                        btn.innerHTML = '<span class="loading loading-spinner loading-lg text-secondary"></span>';
+                        btn.disabled = true;
+                    }
+                });
             }
         });
         """)
@@ -481,6 +500,9 @@ def serve():
             action="/inject",
             method="post",
             enctype="multipart/form-data",
+            id="upload-form",
+            hx_boost="true",  # Use HTMX to enhance the form
+            hx_indicator="#process-button",  # Show loading state on this element
             cls="mb-6"
         )
         
