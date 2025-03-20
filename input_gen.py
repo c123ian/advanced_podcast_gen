@@ -757,19 +757,13 @@ def serve():
                     const totalEstimated = 7 * 60; // 7 minutes in seconds
                     const progressPct = Math.min(95, Math.floor((elapsed / totalEstimated) * 100));
                     
-                    // Update progress bar
-                    const progressBar = document.getElementById('progress-bar');
-                    if (progressBar) progressBar.style.width = progressPct + '%';
-                    
-                    // Update time estimate
+                    // Update time estimate - only show elapsed time
                     const elapsedMin = Math.floor(elapsed / 60);
                     const elapsedSec = Math.floor(elapsed % 60);
-                    const remainingMin = Math.max(0, Math.floor((totalEstimated - elapsed) / 60));
-                    const remainingSec = Math.max(0, Math.floor((totalEstimated - elapsed) % 60));
                     
                     const timeInfo = document.getElementById('time-estimate');
                     if (timeInfo) {{
-                        timeInfo.innerText = `Elapsed: ${{elapsedMin}}m ${{elapsedSec}}s | Est. remaining: ${{remainingMin}}m ${{remainingSec}}s`;
+                        timeInfo.innerText = `Time elapsed: ${{elapsedMin}}m ${{elapsedSec}}s`;
                     }}
                     
                     // If podcast is complete and audio exists, reload the page once
@@ -809,8 +803,8 @@ def serve():
         status_indicator = Div(
             # Status icon (checkmark or loading indicator)
             Div(
-                Span("✓", cls="text-4xl") if (is_completed and audio_exists) else NotStr('<div class="loading loading-dots loading-lg"></div>'),
-                cls="text-success mb-6 mx-auto",
+                Span("✓", cls="text-4xl") if (is_completed and audio_exists) else NotStr('<div class="loading loading-infinity loading-xl"></div>'),
+                cls="text-warning mb-6 text-center",
                 id="status-icon"
             ),
             
@@ -818,18 +812,10 @@ def serve():
             P(f"Status: {status}", cls="text-lg mb-2 text-center text-white", id="status-text"),
             P(notes or "Processing in progress...", cls="text-sm mb-4 text-center text-white", id="status-notes"),
             
-            # Progress bar and time estimate (only for in-progress)
+            # Time elapsed only (only for in-progress)
             Div(
-                Div(
-                    Div(
-                        cls="bg-blue-400 h-2.5 rounded-full", 
-                        style="width: 0%",
-                        id="progress-bar"
-                    ),
-                    cls="w-full bg-gray-700 rounded-full h-2.5 mb-2"
-                ),
                 P(
-                    "Calculating time estimate...",
+                    "Calculating elapsed time...",
                     cls="text-xs text-center text-white",
                     id="time-estimate"
                 ),
