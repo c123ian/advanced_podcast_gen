@@ -682,9 +682,9 @@ def serve():
                 Div(
                     NotStr(f'<audio src="/audio-raw/{injection_id}" controls autoplay class="w-full rounded-lg shadow mb-4"></audio>'),
                     A("Download Podcast", 
-                      href=f"/audio-raw/{injection_id}", 
-                      download=f"podcast_{injection_id}.wav", 
-                      cls="btn btn-secondary w-full"),
+                    href=f"/audio-raw/{injection_id}", 
+                    download=f"podcast_{injection_id}.wav", 
+                    cls="btn btn-secondary w-full"),
                     cls="bg-black bg-opacity-30 p-4 rounded-lg"
                 ),
                 id="audio-player",
@@ -734,8 +734,13 @@ def serve():
         
         # Only include this script if not already completed with available audio
         status_polling_script = Script(f"""
-        // Only set up polling if not already completed
-        const checkStatus = function() {{
+        // Global variable to hold the timeout ID
+        let pollTimeoutId = null;
+        
+        // Function to check status
+        function checkStatus() {{
+            console.log("Checking podcast status...");
+            
             fetch('/podcast-status-api/{injection_id}')
                 .then(response => response.json())
                 .then(data => {{
@@ -772,36 +777,60 @@ def serve():
                         timeInfo.innerText = `Elapsed: ${{elapsedMin}}m ${{elapsedSec}}s | Est. remaining: ${{remainingMin}}m ${{remainingSec}}s`;
                     }}
                     
-                    // If podcast is complete and audio exists, reload the page once
+                    // IMPORTANT: If podcast is complete and audio exists, reload the page and stop polling
                     if (data.is_completed && data.audio_exists) {{
-                        console.log('Podcast is ready! Reloading page to show player...');
+                        console.log('Podcast is ready! Stopping polls and reloading page...');
                         
-                        // Show a brief message before reload
+                        // Show completion message
                         const statusIcon = document.getElementById('status-icon');
                         if (statusIcon) statusIcon.innerHTML = '<span class="text-4xl">✓</span>';
                         
                         document.getElementById('status-notes').innerText = 'Podcast is ready! Loading player...';
                         
+                        // Very important: Clear the timeout to stop polling
+                        if (pollTimeoutId) {{
+                            console.log('Clearing timeout ID:', pollTimeoutId);
+                            clearTimeout(pollTimeoutId);
+                            pollTimeoutId = null;
+                        }}
+                        
                         // Brief delay then reload
                         setTimeout(() => window.location.reload(), 1000);
-                        return; // Stop further polling
+                        return; // Exit function immediately
                     }}
                     
-                    // Continue polling if not complete
+                    // IMPORTANT: Only continue polling if not completed
                     if (!data.is_completed) {{
-                        setTimeout(checkStatus, {poll_interval});
+                        console.log('Podcast not complete, continuing to poll...');
+                        pollTimeoutId = setTimeout(checkStatus, {poll_interval});
+                    }} else {{
+                        // If completed but no audio yet, poll at reduced frequency
+                        console.log('Podcast completed but audio not ready, polling less frequently...');
+                        pollTimeoutId = setTimeout(checkStatus, {poll_interval * 2});
                     }}
                 }})
                 .catch(error => {{
                     console.error('Error checking status:', error);
-                    // Continue polling even on error, but with longer interval
-                    setTimeout(checkStatus, {poll_interval * 2});
+                    // Continue polling even on error, with longer interval
+                    pollTimeoutId = setTimeout(checkStatus, {poll_interval * 2});
                 }});
-        }};
+        }}
         
-        // Start polling immediately (if not already completed)
+        // Start polling (only if we're not already on a page with a completed podcast)
         if (!document.getElementById('completed-indicator')) {{
+            console.log('Starting status polling...');
+            // Start the first poll
             checkStatus();
+            
+            // Cleanup on page unload
+            window.addEventListener('beforeunload', function() {{
+                if (pollTimeoutId) {{
+                    console.log('Page unloading, clearing timeout');
+                    clearTimeout(pollTimeoutId);
+                }}
+            }});
+        }} else {{
+            console.log('Podcast already completed, not starting polling');
         }}
         """) if not (is_completed and audio_exists) else None
         
@@ -846,9 +875,9 @@ def serve():
         # Expected time info - only show if not completed with audio
         time_info = Div(
             P("Podcast generation takes approximately 5-10 minutes.", 
-              cls="text-center text-white mb-2"),
+            cls="text-center text-white mb-2"),
             P("This page will automatically update when your podcast is ready.", 
-              cls="text-center text-white mb-4"),
+            cls="text-center text-white mb-4"),
             cls="mb-4 p-4 bg-black bg-opacity-30 rounded-lg",
             id="time-info"
         ) if not (is_completed and audio_exists) else None
@@ -867,7 +896,7 @@ def serve():
                 audio_player,  # Only included if status is completed and audio exists
                 A("← Back to Home", href="/", cls="btn btn-primary block mx-auto mt-6"),
                 P(f"Podcast ID: {injection_id}", 
-                  cls="text-center text-white opacity-70 text-sm mt-4 font-mono"),
+                cls="text-center text-white opacity-70 text-sm mt-4 font-mono"),
                 cls="container mx-auto px-4 py-8 max-w-3xl"
             ),
             cls="animated-bg min-h-screen"
