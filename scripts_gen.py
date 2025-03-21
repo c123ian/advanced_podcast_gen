@@ -27,7 +27,7 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_INPUT_CHARS = 75000  # Consistent with input_gen.py
 SUMMARIZATION_THRESHOLD = 30000  # Only summarize texts longer than this
 TARGET_SUMMARY_LENGTH = 25000  # Target length for summarized content
-MAX_SCRIPT_EXCHANGES = 35  # Maximum number of exchanges in a script
+MAX_SCRIPT_EXCHANGES = 38  # Maximum number of exchanges in a script
 
 # Create necessary directories
 os.makedirs(SCRIPTS_FOLDER, exist_ok=True)
@@ -271,6 +271,35 @@ def truncate_script(script_data, max_exchanges=MAX_SCRIPT_EXCHANGES):
     
     return script_data[:end_idx]
 
+# NEW HELPER FUNCTION TO HANDLE THE "---" MARKER ISSUE
+def truncate_at_separator(script_data):
+    """
+    Truncate script at any "---" separator markers, which indicate the end of usable content.
+    This fixes issues with malformed scripts that have content after separators.
+    """
+    truncated_script = []
+    
+    for speaker, text in script_data:
+        # Check if this text contains the separator
+        if " --- " in text:
+            # Keep only the content before the first separator
+            clean_text = text.split(" --- ")[0].strip()
+            print(f"⚠️ Found separator marker in script. Truncating text from {len(text)} to {len(clean_text)} chars")
+            truncated_script.append((speaker, clean_text))
+            # Stop processing after finding a separator
+            break
+        else:
+            # Keep the line as is
+            truncated_script.append((speaker, text))
+    
+    # If we truncated anything, add a clean ending if needed
+    if len(truncated_script) < len(script_data):
+        # If the last line is from Speaker 1, add a closing line from Speaker 2
+        if truncated_script and truncated_script[-1][0] == "Speaker 1":
+            truncated_script.append(("Speaker 2", "That's really fascinating! Thank you for explaining that to me."))
+            
+    return truncated_script if truncated_script else script_data
+
 # Load Llama8B specific image
 llama_image = (
     modal.Image.debian_slim(python_version="3.10")
@@ -303,13 +332,17 @@ except modal.exception.NotFoundError:
     timeout=24 * 60 * 60,
     volumes={LLAMA_DIR: llm_volume, "/data": shared_volume} if LLAMA_DIR else {"/data": shared_volume},
 )
-def generate_script(source_text: str) -> str:
+def generate_script(source_text: str, retry_count: int = 0) -> str:
     """
     Generates a podcast script from source text with dedicated summarization
     but preserving the two-step generation process.
     Returns the base64 encoded pickled script (list of tuples).
     """
     print(f"🚀 Generating script from text of length: {len(source_text)} characters")
+    
+    # If this is a retry, log it
+    if retry_count > 0:
+        print(f"⚠️ This is retry attempt #{retry_count} after detecting problematic script size")
     
     # Step 1: Use dedicated summarization for very long texts
     if len(source_text) > SUMMARIZATION_THRESHOLD:
@@ -403,6 +436,53 @@ def generate_script(source_text: str) -> str:
     
     # Serialize the script for passing to the audio generation function
     serialized_data = pickle.dumps(final_script)
+    
+    # NEW CODE: Check if the size of the serialized data is too large (≥ 10.1 KiB)
+    max_size_kb = 10.1 * 1024  # 10.1 KiB in bytes as the threshold
+    actual_size = len(serialized_data)
+    actual_size_kb = actual_size / 1024
+    
+    # Check if size is at or above the problematic threshold
+    is_too_large = actual_size >= max_size_kb
+    max_retries = 3
+    
+    if is_too_large:
+        print(f"⚠️ Detected large script size: {actual_size} bytes ({actual_size_kb:.2f} KiB) - threshold is {max_size_kb/1024:.2f} KiB")
+        
+        if retry_count < max_retries:
+            print(f"⚠️ This large size may cause issues. Restarting process to generate a smaller script (attempt {retry_count + 1}/{max_retries})...")
+            
+            # Add a directive to generate a more concise script
+            random_seed = str(uuid.uuid4().hex)[:8]  # Use a random seed for variation
+            modified_text = source_text + f"\n\nImportant: Generate a CONCISE podcast script with fewer exchanges. Keep it brief. [seed:{random_seed}]"
+            
+            # Recursive call to restart generation with incremented retry counter
+            return generate_script(modified_text, retry_count + 1)
+        else:
+            print(f"⚠️ Still generated large scripts after {max_retries} attempts. Creating compact fallback script...")
+            
+            # Create a guaranteed fallback script that's smaller
+            fallback_script = [
+                ("Speaker 1", f"Welcome to our podcast! Today we're exploring the topic: '{source_text[:50]}...'"),
+                ("Speaker 2", "Hmm, sounds interesting! What are the main points?"),
+                ("Speaker 1", f"The key aspects are as follows. First, {source_text[50:150]}..."),
+                ("Speaker 2", "I see. And what's the significance of this?"),
+                ("Speaker 1", "That's a great question. In essence..."),
+                ("Speaker 2", "Any final takeaways for our listeners?"),
+                ("Speaker 1", "Absolutely. To summarize: understand the context, analyze the implications, and apply the insights. Thanks for listening!")
+            ]
+            
+            # Replace our large script with the compact fallback
+            serialized_data = pickle.dumps(fallback_script)
+            actual_size = len(serialized_data)
+            actual_size_kb = actual_size / 1024
+            print(f"Created compact fallback script with size: {actual_size_kb:.2f} KiB")
+    
     encoded_data = base64.b64encode(serialized_data).decode('utf-8')
     
+    # Log final script info
+    print(f"Final serialized script size: {actual_size_kb:.2f} KiB")
+    if retry_count > 0 and not is_too_large:
+        print(f"✅ Successfully generated smaller script after {retry_count} retry attempts")
+        
     return encoded_data
