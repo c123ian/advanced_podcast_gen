@@ -8,6 +8,11 @@ A system that automatically creates podcasts from any text content. Upload a PDF
 
 This application takes content from various sources, transforms it into a conversational podcast script, adds natural speech patterns (umms, laughs, pauses), and generates high-quality audio using Bark TTS. The entire pipeline runs on Modal Labs for scalable cloud deployment.
 
+![image](https://github.com/user-attachments/assets/ae1bbdc0-c337-4075-a741-1c774067df46)
+
+![image](https://github.com/user-attachments/assets/2ff07f65-7f3c-4d94-913d-e62981aa271d)
+
+
 ### ✨ Key Features
 
 - **Multiple Input Types**: Process PDFs, web pages, text files, or audio transcriptions
