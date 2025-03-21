@@ -2,7 +2,6 @@
 
 A system that automatically creates podcasts from any text content. Upload a PDF, text file, website, or audio, and the system generates a natural conversational podcast between two speakers using AI.
 
-![Project Banner](https://user-images.githubusercontent.com/24665/171092805-b41286b2-be4a-4aab-9ee6-d604699cc507.png)
 
 ## 🎙️ Overview
 
