@@ -1,4 +1,4 @@
-# Multi-File Podcast Generator
+# Podcast Generator
 
 A system that automatically creates podcasts from any text content. Upload a PDF, text file, website, or audio, and the system generates a natural conversational podcast between two speakers using AI.
 
@@ -24,7 +24,7 @@ This application takes content from various sources, transforms it into a conver
 
 ## 🏗️ Architecture
 
-The system consists of three main components based on the [Llama cookbook example](https://github.com/meta-llama/llama-cookbook/tree/main/end-to-end-use-cases/NotebookLlama) that run as separate but coordinated services:
+The system consists of three main components based on the [Llama cookbook example](https://github.com/meta-llama/llama-cookbook/tree/main/end-to-end-use-cases/NotebookLlama) that run as separate but [coordinated services](https://modal.com/docs/guide/project-structure):
 
 ![image](https://github.com/user-attachments/assets/b1428214-507f-4fef-a6ca-fcdb0389f41c)
 
