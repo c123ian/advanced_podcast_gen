@@ -89,27 +89,7 @@ The system has multiple safeguards to prevent content that would create excessiv
    modal deploy deploy.py
    ```
 
-## 💻 Usage
-
-### Web Interface
-
-1. Access the app at the URL provided after deployment
-2. Upload a PDF, text file, website URL, or audio file
-3. Wait for processing (can take 15-40 minutes depending on content length)
-4. Listen to your podcast directly in the browser
-
-### Checking Status
-
-1. Note your podcast ID after uploading content
-2. Use the "Check Status" form to monitor progress
-3. The status page will automatically refresh to show progress updates
-4. When complete, the audio player appears automatically
-
 ## ⚙️ Technical Details
-
-# Advanced Technical Implementation Details
-
-## Audio Generation Architecture
 
 ### Overcoming Bark's 13-Second Limitation
 
