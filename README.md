@@ -26,9 +26,8 @@ This application takes content from various sources, transforms it into a conver
 
 The system consists of three main components that run as separate but coordinated services:
 
-![NotebookLLama](https://github.com/user-attachments/assets/20b5ba98-4947-4c96-9a15-d1f87868bd97)
+![image](https://github.com/user-attachments/assets/b1428214-507f-4fef-a6ca-fcdb0389f41c)
 
-[source](https://github.com/meta-llama/llama-cookbook/blob/main/end-to-end-use-cases/NotebookLlama/TTS_Notes.md) 
 
 ### 📁 Files and Their Roles
 
