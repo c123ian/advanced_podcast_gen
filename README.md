@@ -277,10 +277,10 @@ modal app logs multi-file-podcast
 - Take advantage of Barks [MUSIC], implement music at the start or end of a podcast using Bark's `♪ ` surronding lyrics gnerated by an LLM (based on podcast topic).
    - The TTS sometimes does hallucinate/generate music at the end of a podcast by itself.
    - Use Bark-small would reduce generation time further but at a quality cost
-
 - Experiment with an alternative TTS model, perhaps with faster generation, could try the newly released [1B CSM variant](https://github.com/SesameAILabs/csm)
 - Add more granular control over podcast style and format (allow user to make addional comments and concatinate that to the scrip generating prompt - similar to Googl'es NotebookLLM feature).
 - Improve summarization for very long content rather then harsh truncation.
+- Upload bark model to a Modal Volume.
 - Use [server-side-events (SSE)](https://github.com/DrChrisLevy/DrChrisLevy.github.io/blob/main/posts/sse/sse.ipynb) to tigger the audio player.
 
 ## 📄 License
