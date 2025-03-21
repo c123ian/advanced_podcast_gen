@@ -839,7 +839,7 @@ def serve():
             # Status icon (checkmark or loading indicator)
             Div(
                 Span("✓", cls="text-4xl") if (is_completed and audio_exists) else NotStr('<div class="loading loading-dots loading-lg"></div>'),
-                cls="text-success mb-6 mx-auto",
+                cls="text-success mb-6 text-center",
                 id="status-icon"
             ),
             
@@ -874,9 +874,9 @@ def serve():
         
         # Expected time info - only show if not completed with audio
         time_info = Div(
-            P("Podcast generation takes approximately 5-10 minutes.", 
+            P("Podcast generation can take 30-40 minutes.", 
             cls="text-center text-white mb-2"),
-            P("This page will automatically update when your podcast is ready.", 
+            P("This page will automatically update when your podcast is ready. But keep note of your Podcast ID!", 
             cls="text-center text-white mb-4"),
             cls="mb-4 p-4 bg-black bg-opacity-30 rounded-lg",
             id="time-info"
