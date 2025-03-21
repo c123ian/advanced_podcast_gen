@@ -48,15 +48,6 @@ The system consists of three main components that run as separate but coordinate
 5. Audio generator converts dialogue to spoken audio
 6. Final podcast is available for listening in browser
 
-### Handling Long Content
-
-The system has multiple safeguards to prevent content that would create excessively long podcasts:
-
-1. **Initial Content Truncation**: Long inputs are truncated to 75,000 characters
-2. **Summarization**: For very long content (>30,000 chars), a dedicated summarizer creates a condensed version
-3. **Script Length Control**: Scripts are limited to 35-40 exchanges between speakers
-4. **Separator Detection**: Any script sections after "---" markers are truncated
-5. **Audio Generation Limits**: If a script would take >45 minutes to generate, it's automatically shortened
 
 ## 🚀 Installation
 
