@@ -107,21 +107,178 @@ The system has multiple safeguards to prevent content that would create excessiv
 
 ## ⚙️ Technical Details
 
-### Audio Generation
+# Advanced Technical Implementation Details
 
-- Uses Bark TTS with specific voice presets for each speaker
-- Supports disfluencies and emotional expressions
-- Maintains consistent voice characteristics across segments
-- Employs randomized seed consistency for reproducible voices
-- Parallel processing of speaker lines for faster generation
+## Audio Generation Architecture
 
-### Content Optimization
+### Overcoming Bark's 13-Second Limitation
 
-- Preprocesses text to remove irrelevant formatting
-- Normalizes quotes and punctuation for better speech output
-- Handles script formats consistently to prevent audio hallucination
-- Intelligent chunking of sentences for natural speech cadence
-- Adds proper silence between speakers for natural conversation flow
+Bark TTS natively only supports ~13 seconds of audio generation per invocation. We implemented a sophisticated long-form generation pipeline based on the approach from [Bark's long-form notebook](https://github.com/suno-ai/bark/blob/main/notebooks/long_form_generation.ipynb), which involved:
+
+```python
+# Split text into sentences using NLTK tokenizer
+sentences = nltk.sent_tokenize(preprocess_text(full_text))
+
+# Process sentence by sentence while maintaining voice consistency
+for sent in sentences:
+    semantic_tokens = generate_text_semantic(
+        sent,
+        history_prompt=voice_preset,
+        temp=text_temp,
+        min_eos_p=0.05,  # Lower threshold prevents hallucinations
+    )
+    
+    audio_array = semantic_to_waveform(
+        semantic_tokens, 
+        history_prompt=voice_preset,
+        temp=waveform_temp,
+    )
+    
+    all_audio.append(audio_array)
+    all_audio.append(chunk_silence)  # Add consistent silence between sentences
+```
+
+### Lower-Level API for Enhanced Control
+
+We abandoned the high-level `generate_audio()` API in favor of the lower-level functions:
+- `generate_text_semantic()`: Converts text to semantic tokens
+- `semantic_to_waveform()`: Renders semantic tokens to audio waveform
+
+This gave us better control over:
+- Temperature parameters (`text_temp` and `waveform_temp`) for both stages
+- End-of-sentence detection via `min_eos_p` parameter
+- Silence insertion between sentences
+
+### Parallel Processing Architecture
+
+We implemented a speaker-based parallelization strategy:
+```python
+# --- Split by speaker for parallel processing ---
+speaker1_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 1"]
+speaker2_lines = [(i, text) for i, (speaker, text) in enumerate(lines) if speaker == "Speaker 2"]
+
+# Process each speaker's lines in parallel on separate GPUs
+if speaker1_lines:
+    speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
+
+if speaker2_lines:
+    speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
+
+# Recombine in original script order
+all_results = speaker1_results + speaker2_results
+all_results.sort(key=lambda x: x[0])  # Sort by original line index
+```
+
+This approach:
+- Deploys two separate GPU containers simultaneously
+- Maintains consistent voice characteristics per speaker
+- Cuts generation time roughly in half
+
+### Voice Consistency Through Modal.Dict
+
+Maintaining consistent voices across distributed containers was a significant challenge. We solved this with Modal's distributed dictionary:
+
+```python
+voice_states = modal.Dict.from_name("voice-states", create_if_missing=True)
+
+# For each speaker, create a deterministic RNG seed
+voice_state_key = f"{injection_id}_{speaker}"
+if voice_states.contains(voice_state_key):
+    seed = voice_states.get(voice_state_key)
+else:
+    # First-time generation creates a new seed (different per speaker)
+    speaker_num = 1 if speaker == "Speaker 1" else 2
+    seed = np.random.randint(10000 * speaker_num, 10000 * (speaker_num + 1) - 1)
+    voice_states[voice_state_key] = seed
+```
+
+## Script Processing Optimizations
+
+### Community-Discovered Disfluencies
+
+The project leverages community-discovered Bark "hidden features" for disfluencies. These aren't officially documented, but were found through experimentation:
+
+```python
+def convert_disfluencies(text):
+    """
+    Convert parenthesized expressions like (laughs) to bracketed [laughs]
+    for proper TTS rendering.
+    """
+    disfluencies = [
+        "laughs", "sighs", "laughter", "gasps", "clears throat", 
+        "sigh", "laugh", "gasp", "chuckles", "snorts",
+        "hmm", "umm", "uh", "ah", "er", "um"
+    ]
+    
+    for disfluency in disfluencies:
+        # Convert various formats to [disfluency]
+        text = re.sub(r'\(' + disfluency + r'\)', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+        text = re.sub(r'<' + disfluency + r'>', '[' + disfluency + ']', text, flags=re.IGNORECASE)
+    
+    return text
+```
+
+Not all disfluencies work equally well; they're emergent behaviors that Bark learned during training rather than explicitly programmed features. `[laughs]` and `hmm` tend to work reliably, while others are less consistent.
+
+### Two-Pass Script Generation
+
+Our script generation follows a sophisticated two-stage approach:
+
+1. **Initial Script Generation**: Uses a system prompt focused on dialogue structure and content organization
+   ```python
+   prompt_1 = SYSTEM_PROMPT + "\n\n" + source_text
+   first_draft = generation_pipe(prompt_1)[0]["generated_text"]
+   ```
+
+2. **Dramatic Rewriting**: A second-pass with a specialized prompt to add natural speech patterns
+   ```python
+   prompt_2 = REWRITE_PROMPT + "\n\n" + first_draft
+   final_text = generation_pipe(prompt_2)[0]["generated_text"]
+   ```
+
+The rewrite prompt specifically instructs the model to add disfluencies:
+```
+REMEMBER THIS WITH YOUR HEART: Re-inject disfluencies FREQUENTLY 
+but ONLY use the following at MINIMUM once: "umm, hmm, [laughs], 
+[sighs], [laughter], [gasps], [clears throat], — for hesitations, 
+CAPITALIZATION for emphasis of a word".
+```
+
+### Script Standardization for TTS
+
+Script standardization was crucial for consistent audio generation:
+
+```python
+def normalize_script_quotes(script):
+    """Normalize the entire script format to match the expected output."""
+    normalized_script = []
+    
+    for speaker, text in script:
+        # Standardize speaker format
+        if speaker.upper() == "SPEAKER 1":
+            speaker = "Speaker 1"
+        elif speaker.upper() == "SPEAKER 2":
+            speaker = "Speaker 2"
+        
+        # Protect contractions
+        text = re.sub(r'(\w)\'(\w)', r'\1APOSTROPHE\2', text)
+        
+        # Standardize all quotes
+        text = text.replace('"', '"').replace("'", '"')
+        
+        # Restore apostrophes in contractions
+        text = text.replace('APOSTROPHE', "'")
+        
+        # Apply disfluencies conversion
+        text = convert_disfluencies(text)
+        
+        normalized_script.append((speaker, text))
+    
+    return normalized_script
+```
+
+This standardization addresses a subtle but critical issue: Bark produces extended silence when encountering inconsistent quote formats. By normalizing to a single standard, we achieved much more fluid speech.
+
 
 ## 🔧 Troubleshooting
 
@@ -148,6 +305,8 @@ modal app logs multi-file-podcast
 - Support additional [input formats](https://github.com/meta-llama/llama-recipes/pull/750) (i.e. YouTube URLs, requires Modal Labs 'Team 'subscription in order to avail of IP Proxy)
 - Take advantage of Barks [MUSIC], implement music at the start or end of a podcast using Bark's `♪ ` surronding lyrics gnerated by an LLM (based on podcast topic).
    - The TTS sometimes does hallucinate/generate music at the end of a podcast by itself.
+   - Use Bark-small would reduce generation time further but at a quality cost
+
 - Experiment with an alternative TTS model, perhaps with faster generation, could try the newly released [1B CSM variant](https://github.com/SesameAILabs/csm)
 - Add more granular control over podcast style and format (allow user to make addional comments and concatinate that to the scrip generating prompt - similar to Googl'es NotebookLLM feature).
 - Improve summarization for very long content rather then harsh truncation.
