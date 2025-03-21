@@ -27,7 +27,8 @@ This application takes content from various sources, transforms it into a conver
 
 The system consists of three main components that run as separate but coordinated services:
 
-![Architecture Diagram](https://mermaid.ink/img/pako:eNp1ksFugzAMhl_F8mknELQD0xxWTduke6_LxSResDCJcMxAFfDuS0qlTZtmLlb8-f_tOD5jVVvOKOKyahcMC5D3Ld9YrZ8Fp3qAT92C4VRs9QYyaEwF-QPk13lYPCxPe6lMBQ7GE95lJzFNx9PGX5YBXIcAb91QO7C9AxoNfCZqe9LKuQZ_WLmzDlQDM6q-lUkyvFVgWd0ZaNdgCr6D99jj3eBXLWhr8UR8XrUq6X1kNVyP7GJwqtZ9r2tQw3y0PQEukf46v3r7_5aB1JIgxVHkJ6fcGKV-n4Zw2G3ZUotwA7iG9a4u4ORfA8xdxBvWtRU8ioC_y06hNiU4qbgI8mU2_24gLFGEvPpxzCJeN-B-OG9UwDdcH3gki4LLKJDJe54t4ji9Szc0jeLNQ0h9GBzZSHO99xlgDzdcUq8?type=png)
+![NotebookLLama](https://github.com/user-attachments/assets/20b5ba98-4947-4c96-9a15-d1f87868bd97)
+[source](https://github.com/meta-llama/llama-cookbook/blob/main/end-to-end-use-cases/NotebookLlama/TTS_Notes.md) 
 
 ### 📁 Files and Their Roles
 
