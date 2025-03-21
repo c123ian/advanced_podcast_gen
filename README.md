@@ -138,9 +138,14 @@ modal app logs multi-file-podcast
 
 ## 🔍 Further Development
 
-- Experiment more with adjusting the prompt, but allow for testing individually at each pahse. 
+- Experiment more with adjusting the prompt/upgrading LLM size, especially to addrress perspective issue:
+   - Currently podcasters take a first-person perspective (i.e., speakers embody the CV subject).
+   - Better to retain podcasters in the third-person perspective (speakers analyze the CV as external content), similar to Google NotebookLLM.
+   - This shift from "persona adoption" to "content discussion" would create a more natural podcast format.
 - Support additional [input formats](https://github.com/meta-llama/llama-recipes/pull/750) (i.e. YouTube URLs, requires Modal Labs 'Team 'subscription in order to avail of IP Proxy)
-- Implement music at the start or end using Bark's `♪ ` surronding lyrics gnerated by an LLM (based on podcast topic)
+- Take advantage of Barks [MUSIC], implement music at the start or end of a podcast using Bark's `♪ ` surronding lyrics gnerated by an LLM (based on podcast topic).
+   - The TTS sometimes does hallucinate/generate music at the end of a podcast by itself.
+- Experiment with an alternative TTS model, perhaps with faster generation, could try the newly released [1B CSM variant](https://github.com/SesameAILabs/csm)
 - Add more granular control over podcast style and format (allow user to make addional comments and concatinate that to the scrip generating prompt - similar to Googl'es NotebookLLM feature).
 - Improve summarization for very long content rather then harsh truncation.
 - Use [server-side-events (SSE)](https://github.com/DrChrisLevy/DrChrisLevy.github.io/blob/main/posts/sse/sse.ipynb) to tigger the audio player.
