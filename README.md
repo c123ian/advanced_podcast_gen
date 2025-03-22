@@ -149,7 +149,7 @@ all_results.sort(key=lambda x: x[0])  # Sort by original line index
 This approach:
 - Deploys two separate GPU containers simultaneously
 - Maintains consistent voice characteristics per speaker
-- Cuts generation time roughly in half
+- I think cuts generation time roughly in half
 
 ### Voice Consistency Through Modal.Dict
 
