@@ -77,6 +77,10 @@ The system consists of three main components based on the [Llama cookbook exampl
    modal run download_llama_8b.py
    ```
 
+   ```bash
+   modal run download_bark.py
+   ```
+
 5. Deploy to Modal:
    ```bash
    modal deploy deploy.py
