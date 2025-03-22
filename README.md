@@ -253,22 +253,6 @@ def normalize_script_quotes(script):
 This standardization addresses a subtle but critical issue: Bark produces extended silence when encountering inconsistent quote formats. By normalizing to a single standard, we achieved much more fluid speech.
 
 
-## 🔧 Troubleshooting
-
-### Common Issues
-
-1. **Audio Player Not Appearing**: Wait for full processing completion or use the direct audio URL
-2. **HTMX Polling Issues**: If status updates stop, manually refresh the page
-3. **Script Generation Failures**: Check for extremely long content or unusual formatting
-4. **Audio Quality Issues**: Script may contain quotes or formatting that affects Bark TTS output
-
-### Advanced Debugging
-
-Check Modal logs for detailed error messages:
-```bash
-modal app logs multi-file-podcast
-```
-
 ## 🔍 Further Development
 
 - Experiment more with adjusting the prompt/upgrading LLM size, especially to addrress perspective issue:
