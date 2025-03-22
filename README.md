@@ -269,9 +269,6 @@ This standardization addresses a subtle but critical issue: Bark produces extend
 - Upload bark model to a Modal Volume.
 - Use [server-side-events (SSE)](https://github.com/DrChrisLevy/DrChrisLevy.github.io/blob/main/posts/sse/sse.ipynb) to tigger the audio player.
 
-## 📄 License
-
-MIT
 
 ## 🙏 Acknowledgments
 
@@ -279,3 +276,4 @@ MIT
 - [Bark TTS](https://github.com/suno-ai/bark) for high-quality text-to-speech
 - [FastHTML](https://github.com/fastai/fasthtml) for the web UI framework
 - [LangChain](https://github.com/langchain-ai/langchain) for document processing
+- [llama-cookbook](https://github.com/meta-llama/llama-cookbook/tree/main/end-to-end-use-cases/NotebookLlama) for the NotebookLlama foundation code
