@@ -72,7 +72,12 @@ The system consists of three main components based on the [Llama cookbook exampl
    modal volume create combined_volume
    ```
 
-4. Deploy to Modal:
+4. Download LLM to Modal volume:
+   ```bash
+   modal run download_llama_8b.py
+   ```
+
+5. Deploy to Modal:
    ```bash
    modal deploy deploy.py
    ```
