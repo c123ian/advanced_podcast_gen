@@ -7,9 +7,11 @@ A system that automatically creates podcasts from any text content. Upload a PDF
 
 
 
-https://github.com/user-attachments/assets/e6509a37-fd52-49ca-baf2-c840ffb30806
+## Samples
 
+https://github.com/user-attachments/assets/24884ec4-8d88-43cb-9385-3144afe6f50b
 
+https://github.com/user-attachments/assets/2f1f1d26-bb38-4f5b-8a2d-19943342318c
 
 
 
