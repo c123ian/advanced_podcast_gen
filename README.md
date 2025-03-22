@@ -46,18 +46,6 @@ The system consists of three main components based on the [Llama cookbook exampl
 4. **`scripts_gen.py`**: Converts raw content to podcast scripts using language models
 5. **`audio_gen.py`**: Converts scripts to audio using Bark TTS
 
-## 🔄 How It Works
-
-### Content Flow
-
-1. User uploads content via web UI
-2. Content is extracted and processed
-3. Raw text is passed to script generator
-4. Script generator creates conversational podcast dialogue
-5. Audio generator converts dialogue to spoken audio
-6. Final podcast is available for listening in browser
-
-
 ## 🚀 Installation
 
 ### Prerequisites
