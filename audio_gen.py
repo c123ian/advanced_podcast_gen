@@ -11,6 +11,14 @@ from typing import List, Tuple
 # Import shared resources
 from common_image import common_image, shared_volume
 
+# Try to look up the Bark models volume
+try:
+    bark_volume = modal.Volume.lookup("bark_models")
+    print("Found existing bark_models volume")
+except modal.exception.NotFoundError:
+    print("Warning: bark_models volume not found. Please run download_bark_models.py first")
+    bark_volume = None
+
 app = modal.App("audio_gen")
 # Create a shared dictionary for voice states (RNG seeds)
 voice_states = modal.Dict.from_name("voice-states", create_if_missing=True)
@@ -115,13 +123,22 @@ def convert_disfluencies(text):
     image=common_image,
     gpu=modal.gpu.A10G(count=1),
     timeout=24*60*60,
-    volumes={"/data": shared_volume},
+    volumes={
+        "/data": shared_volume,
+        "/bark_models": bark_volume  # Add the Bark models volume
+    } if bark_volume else {"/data": shared_volume},
 )
 def generate_speaker_audio(speaker_lines: List[Tuple[int, str]], 
                           speaker: str, 
                           injection_id: str = None) -> List[Tuple[int, np.ndarray, int]]:
     """Generate audio for all lines from a single speaker with progress updates"""
     print(f"🎙️ Starting audio generation for {speaker} with {len(speaker_lines)} lines")
+    
+    # Set environment variables to use the pre-downloaded models if available
+    if os.path.exists('/bark_models'):
+        print("Using pre-downloaded Bark models from volume")
+        os.environ["XDG_CACHE_HOME"] = "/bark_models"
+    
     preload_models()  # Ensure Bark model is loaded
 
     def update_speaker_status(progress_msg):
@@ -247,7 +264,10 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
     # No GPU needed for the coordinator
     container_idle_timeout=10*60,
     timeout=24*60*60,
-    volumes={"/data": shared_volume},
+    volumes={
+        "/data": shared_volume,
+        "/bark_models": bark_volume  # Add the Bark models volume
+    } if bark_volume else {"/data": shared_volume},
     allow_concurrent_inputs=100,
 )
 def generate_audio(encoded_script: str, injection_id: str = None) -> str:
@@ -255,6 +275,11 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
     Now with simplified path handling and multiple volume commits for reliability
     """
+    # Set environment variables to use the pre-downloaded models if available
+    if os.path.exists('/bark_models'):
+        print("Using pre-downloaded Bark models from volume")
+        os.environ["XDG_CACHE_HOME"] = "/bark_models"
+    
     def update_status(status, notes=None):
         """Helper function to update database status and notes"""
         if not injection_id:
