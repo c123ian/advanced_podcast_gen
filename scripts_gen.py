@@ -17,6 +17,19 @@ from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
+# Setup NLTK for sentence splitting and summarization
+NLTK_DATA_DIR = "/tmp/nltk_data"
+os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+nltk.data.path.append(NLTK_DATA_DIR)
+
+# Pre-download required NLTK resources to avoid issues during processing
+try:
+    nltk.download("punkt", download_dir=NLTK_DATA_DIR)
+    nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
+    print("✅ NLTK resources downloaded successfully")
+except Exception as e:
+    print(f"⚠️ Warning: Failed to download NLTK resources: {e}")
+
 # Define app
 app = modal.App("scripts_gen")
 
@@ -347,8 +360,7 @@ def generate_script(source_text: str, retry_count: int = 0) -> str:
     # Step 1: Use dedicated summarization for very long texts
     if len(source_text) > SUMMARIZATION_THRESHOLD:
         try:
-            # Download NLTK data if needed (required by sumy)
-            nltk.download('punkt')
+            # No need to download NLTK data here - already done at module level
             source_text = summarize_long_text(source_text)
         except Exception as e:
             print(f"⚠️ Error during summarization: {e}. Using basic truncation instead.")
