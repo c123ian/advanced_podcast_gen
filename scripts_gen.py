@@ -39,7 +39,7 @@ SCRIPTS_FOLDER = "/data/podcast_scripts"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_INPUT_CHARS = 75000  # Consistent with input_gen.py
 SUMMARIZATION_THRESHOLD = 30000  # Only summarize texts longer than this
-TARGET_SUMMARY_LENGTH = 25000  # Target length for summarized content
+TARGET_SUMMARY_LENGTH = 5000  # Target length for summarized content
 MAX_SCRIPT_EXCHANGES = 38  # Maximum number of exchanges in a script
 
 # Create necessary directories
@@ -145,25 +145,19 @@ def convert_disfluencies(text):
     return text
 
 def summarize_long_text(text, max_length=TARGET_SUMMARY_LENGTH):
-    """Use dedicated summarization library instead of LLM for summarization"""
-    if len(text) <= max_length:
-        return text
-        
-    print(f"📝 Summarizing long text ({len(text)} chars) with sumy...")
-    
-    # Use the LexRank algorithm for extractive summarization (keeps original sentences)
+    # Use a more aggressive approach - target much shorter output
     parser = PlaintextParser.from_string(text, Tokenizer("english"))
     
-    # Calculate how many sentences we need (~100 chars per sentence on average)
-    target_sentences = max_length // 100
+    # Target significantly fewer sentences - aim for 15-20% of original length
+    target_sentences = max(15, int(max_length // 200))  # ~200 chars per sentence
     
-    # Create summarizer and extract the most important sentences
     summarizer = LexRankSummarizer()
     summary_sentences = summarizer(parser.document, target_sentences)
     
-    # Join the sentences into a coherent text
+    # Join sentences into coherent text and truncate if still needed
     result = " ".join(str(sentence) for sentence in summary_sentences)
-    print(f"✅ Generated summary of {len(result)} chars with {len(summary_sentences)} sentences")
+    if len(result) > max_length:
+        result = result[:max_length-100] + "... [Content truncated due to length]"
     
     return result
 
@@ -468,8 +462,8 @@ def generate_script(source_text: str, retry_count: int = 0) -> str:
             random_seed = str(uuid.uuid4().hex)[:8]  # Use a random seed for variation
             modified_text = source_text + f"\n\nImportant: Generate a CONCISE podcast script with fewer exchanges. Keep it brief. [seed:{random_seed}]"
             
-            # Recursive call to restart generation with incremented retry counter
-            return generate_script(modified_text, retry_count + 1)
+            # KEY FIX: Use .remote() instead of directly calling the function recursively
+            return generate_script.remote(modified_text, retry_count + 1)
         else:
             print(f"⚠️ Still generated large scripts after {max_retries} attempts. Creating compact fallback script...")
             
