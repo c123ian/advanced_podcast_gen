@@ -1,4 +1,4 @@
-import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time
+import modal, torch, io, ast, base64, pickle, re, numpy as np, nltk, os, time, random, json
 from scipy.io import wavfile
 from pydub import AudioSegment
 # Import the specific low-level Bark functions
@@ -36,9 +36,96 @@ nltk.data.path.append(NLTK_DATA_DIR)
 nltk.download("punkt", download_dir=NLTK_DATA_DIR)
 nltk.download("punkt_tab", download_dir=NLTK_DATA_DIR)
 
-# Define persistent storage path for audio files
+# Define persistent storage paths
 AUDIO_OUTPUT_DIR = "/data/podcast_audio"
+STATUS_DIR = "/data/status"  # New directory for file-based status tracking
+
+# Ensure directories exist
 os.makedirs(AUDIO_OUTPUT_DIR, exist_ok=True)
+os.makedirs(STATUS_DIR, exist_ok=True)
+
+# Functions for additional status tracking
+def get_audio_file_path(injection_id):
+    """Returns a standardized path for audio files based on injection_id"""
+    return os.path.join(AUDIO_OUTPUT_DIR, f"podcast_{injection_id}.wav")
+
+def save_status_file(injection_id, status, notes=None, file_path=None):
+    """Save status to a file as a fallback when database is unavailable"""
+    if not injection_id:
+        return
+        
+    status_file = os.path.join(STATUS_DIR, f"{injection_id}.json")
+    status_data = {
+        "id": injection_id,
+        "status": status,
+        "notes": notes,
+        "file_path": file_path,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    try:
+        with open(status_file, "w") as f:
+            json.dump(status_data, f)
+        print(f"✅ Saved status file for ID: {injection_id}")
+    except Exception as e:
+        print(f"⚠️ Error saving status file: {e}")
+
+def update_injection_status(injection_id, status, notes=None, max_retries=5):
+    """Update database status with retry logic and file-based fallback"""
+    if not injection_id:
+        return
+    
+    # Always save to file-based status system for reliability
+    audio_path = get_audio_file_path(injection_id)
+    save_status_file(injection_id, status, notes, audio_path)
+        
+    # Then try database with retries
+    for attempt in range(max_retries):
+        try:
+            import sqlite3
+            DB_PATH = "/data/injections_truncate.db"
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)  # Longer timeout
+            cursor = conn.cursor()
+            
+            # Enable WAL mode for better concurrency
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            
+            # Update status and/or notes
+            if notes:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, processing_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, notes, injection_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, injection_id)
+                )
+                
+            conn.commit()
+            conn.close()
+            print(f"✅ Updated status to '{status}' for ID: {injection_id}")
+            
+            if notes:
+                print(f"📝 Notes: {notes}")
+                
+            return
+            
+        except sqlite3.OperationalError as e:
+            # Handle database lock errors
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1  # Exponential backoff
+                print(f"⚠️ Database locked, retrying in {wait_time:.2f} seconds (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                print(f"⚠️ Error updating injection status after {attempt+1} attempts: {e}")
+                break
+        except Exception as e:
+            print(f"⚠️ Error updating injection status: {e}")
+            break
+    
+    # If we get here, all retries failed but we still have the file-based status
 
 def normalize_script_format(script_data):
     """Ensures the script is in the correct format of (speaker, text) tuples"""
@@ -142,34 +229,52 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
     preload_models()  # Ensure Bark model is loaded
 
     def update_speaker_status(progress_msg):
-        """Helper to update database with current speaker progress"""
+        """Helper to update both database and file-based status"""
         if not injection_id:
             return
             
+        # Save to file-based status system first (faster and more reliable)
+        audio_path = get_audio_file_path(injection_id) if injection_id else None
+        full_msg = f"{speaker}: {progress_msg}"
+        save_status_file(injection_id, "processing", full_msg, audio_path)
+        
+        # Then try database with retries
         try:
             import sqlite3
             DB_PATH = "/data/injections_truncate.db"
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
             
-            # First get the current status and notes
-            cursor.execute(
-                "SELECT status, processing_notes FROM injections WHERE id = ?",
-                (injection_id,)
-            )
-            result = cursor.fetchone()
-            
-            if result:
-                status, notes = result
-                # Only update notes, keep status as "processing"
-                new_notes = f"{speaker}: {progress_msg}"
-                cursor.execute(
-                    "UPDATE injections SET processing_notes = ? WHERE id = ?",
-                    (new_notes, injection_id)
-                )
-                conn.commit()
-                print(f"✅ Updated progress for {speaker} in database: {progress_msg}")
-            conn.close()
+            for attempt in range(3):  # Try up to 3 times
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=5.0)
+                    cursor = conn.cursor()
+                    
+                    # Enable WAL mode
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    
+                    # Get current status
+                    cursor.execute(
+                        "SELECT status FROM injections WHERE id = ?",
+                        (injection_id,)
+                    )
+                    result = cursor.fetchone()
+                    
+                    if result:
+                        # Only update notes, keep status as "processing"
+                        cursor.execute(
+                            "UPDATE injections SET processing_notes = ? WHERE id = ?",
+                            (full_msg, injection_id)
+                        )
+                        conn.commit()
+                        print(f"✅ Updated progress for {speaker} in database: {progress_msg}")
+                    conn.close()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < 2:
+                        wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1
+                        time.sleep(wait_time)
+                    else:
+                        print(f"⚠️ Error updating speaker status in DB: {e}")
+                        break
         except Exception as e:
             print(f"⚠️ Error updating speaker status: {e}")
 
@@ -273,46 +378,24 @@ def generate_speaker_audio(speaker_lines: List[Tuple[int, str]],
 def generate_audio(encoded_script: str, injection_id: str = None) -> str:
     """
     Takes the serialized script from generate_script() -> runs Bark TTS -> returns final .wav path
-    Now with simplified path handling and multiple volume commits for reliability
+    Now with improved error handling, status tracking, and volume management
     """
     # Set environment variables to use the pre-downloaded models if available
     if os.path.exists('/bark_models'):
         print("Using pre-downloaded Bark models from volume")
         os.environ["XDG_CACHE_HOME"] = "/bark_models"
     
-    def update_status(status, notes=None):
-        """Helper function to update database status and notes"""
-        if not injection_id:
-            return
-            
-        try:
-            import sqlite3
-            DB_PATH = "/data/injections_truncate.db"
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            
-            if notes:
-                cursor.execute(
-                    "UPDATE injections SET status = ?, processing_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (status, notes, injection_id)
-                )
-            else:
-                cursor.execute(
-                    "UPDATE injections SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (status, injection_id)
-                )
-            conn.commit()
-            conn.close()
-            print(f"✅ Updated status to '{status}' for ID: {injection_id}")
-            if notes:
-                print(f"📝 Notes: {notes}")
-        except Exception as e:
-            print(f"⚠️ Error updating database: {e}")
+    # Standardized output path
+    audio_file_path = get_audio_file_path(injection_id) if injection_id else None
+    
+    # Initialize both database and file-based status
+    update_injection_status(injection_id, "processing", "Starting audio generation...", max_retries=3)
+    save_status_file(injection_id, "processing", "Starting audio generation...", audio_file_path)
+    
+    # Early volume commit to ensure status files are visible
+    shared_volume.commit()
     
     print(f"🔊 Bark TTS starting with parallel processing. Received encoded script of size: {len(encoded_script)} bytes")
-    
-    # First status update - starting processing
-    update_status("processing", "Preparing to generate audio...")
 
     def numpy_to_audio_segment(audio_arr, sr):
         """Converts numpy audio array to an AudioSegment"""
@@ -332,7 +415,7 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
 
     try:
         # --- Step 1: Decode the serialized script ---
-        update_status("processing", "Decoding script data...")
+        update_injection_status(injection_id, "processing", "Decoding script data...")
         try:
             print("Decoding base64 script data...")
             binary_data = base64.b64decode(encoded_script.encode('utf-8'))
@@ -348,7 +431,7 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             lines = normalize_script_format(script_data)
             print(f"Successfully decoded script with {len(lines)} dialogue lines")
             
-            update_status("processing", f"Preparing to generate audio for {len(lines)} dialogue lines")
+            update_injection_status(injection_id, "processing", f"Preparing to generate audio for {len(lines)} dialogue lines")
 
             # Final safety check for script length
             if len(lines) > MAX_SCRIPT_LINES:
@@ -357,7 +440,8 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
                 lines = lines[:MAX_SCRIPT_LINES]
                 
                 # Update processing notes
-                update_status(
+                update_injection_status(
+                    injection_id, 
                     "processing", 
                     f"Script truncated from {len(script_data)} to {MAX_SCRIPT_LINES} lines (removed {truncated_lines} lines)"
                 )
@@ -366,11 +450,14 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             # Calculate estimated processing time
             estimated_time = estimate_processing_time(lines)
             print(f"✨ Estimated processing time: {estimated_time} for {len(lines)} lines")
-            update_status("processing", f"Estimated processing time: {estimated_time}")
+            update_injection_status(injection_id, "processing", f"Estimated processing time: {estimated_time}")
+            
+            # Intermediate volume commit to ensure status updates are visible
+            shared_volume.commit()
             
         except Exception as e:
             print(f"❌ Error decoding serialized script: {e}")
-            update_status("error", f"Error decoding script: {str(e)}")
+            update_injection_status(injection_id, "error", f"Error decoding script: {str(e)}")
             
             # Create a minimal fallback script
             lines = [
@@ -380,10 +467,10 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
                 ("Speaker 2", "That's fascinating. What else should we know?")
             ]
             print("Using fallback script instead")
-            update_status("processing", f"Using fallback script due to error: {str(e)}")
+            update_injection_status(injection_id, "processing", f"Using fallback script due to error: {str(e)}")
 
         # --- SPEAKER SEPARATION FOR PARALLEL PROCESSING ---
-        update_status("processing", "Separating speaker dialogue for parallel processing...")
+        update_injection_status(injection_id, "processing", "Separating speaker dialogue for parallel processing...")
         
         # Print the first few lines to verify input format
         print("DEBUG - Original script format:")
@@ -411,16 +498,19 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         # Only process if there are lines for that speaker
         if speaker1_lines:
             print(f"  Sending {len(speaker1_lines)} Speaker 1 lines to GPU #1")
-            update_status("processing", f"Generating voice for Speaker 1 ({len(speaker1_lines)} lines)...")
+            update_injection_status(injection_id, "processing", f"Generating voice for Speaker 1 ({len(speaker1_lines)} lines)...")
             speaker1_results = generate_speaker_audio.remote(speaker1_lines, "Speaker 1", injection_id)
 
         if speaker2_lines:
             print(f"  Sending {len(speaker2_lines)} Speaker 2 lines to GPU #2")
-            update_status("processing", f"Generating voice for Speaker 2 ({len(speaker2_lines)} lines)...")
+            update_injection_status(injection_id, "processing", f"Generating voice for Speaker 2 ({len(speaker2_lines)} lines)...")
             speaker2_results = generate_speaker_audio.remote(speaker2_lines, "Speaker 2", injection_id)
+        
+        # Volume commit to ensure status updates are visible
+        shared_volume.commit()
 
         # --- Combine results in original script order ---
-        update_status("processing", "Speaker audio generated. Combining audio segments...")
+        update_injection_status(injection_id, "processing", "Speaker audio generated. Combining audio segments...")
         all_results = speaker1_results + speaker2_results
         all_results.sort(key=lambda x: x[0])  # Sort by original script line index
 
@@ -428,7 +518,7 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
         print("  Recombining in original script order based on line indices...")
 
         # --- Assemble final audio ---
-        update_status("processing", "Assembling final podcast audio...")
+        update_injection_status(injection_id, "processing", "Assembling final podcast audio...")
         segments = []
         rates = []
         turn_silence = np.zeros(int(0.25 * SAMPLE_RATE), dtype=np.float32)  # Silence between turns
@@ -438,52 +528,88 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
             segments.append(turn_silence)  # Add half-second silence between turns
             rates.append(sr)
             rates.append(sr)  # Need matching rate for silence
-
-        # --- Define standardized output path ---
-        # Use a consistent file naming pattern based on injection_id
-        final_audio_path = f"/data/podcast_audio/podcast_{injection_id}.wav"
         
         # --- Save to file ---
-        update_status("processing", "Saving final podcast audio file...")
+        update_injection_status(injection_id, "processing", "Saving final podcast audio file...")
         final_clip = concatenate_audio_segments(segments, rates)
-        final_clip.export(final_audio_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
-
-        # Early commit to ensure file is visible
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(audio_file_path), exist_ok=True)
+        
+        # Export with explicit error handling
+        try:
+            final_clip.export(audio_file_path, format="wav", codec="pcm_s16le")  # Ensure proper WAV encoding
+            print(f"✅ Audio file exported to: {audio_file_path}")
+        except Exception as e:
+            error_msg = f"Error exporting audio: {str(e)}"
+            print(f"❌ {error_msg}")
+            update_injection_status(injection_id, "error", error_msg)
+            raise
+        
+        # Multiple explicit volume commits for reliability
+        shared_volume.commit()
+        time.sleep(0.5)  # Brief pause
         shared_volume.commit()
         
         # Update database with completed status and the final path
-        update_status(
+        update_injection_status(
+            injection_id, 
             "completed", 
             f"Generated podcast with {len(lines)} dialogue lines. Audio saved as podcast_{injection_id}.wav"
         )
 
         # Update database with file path information
-        def update_database_path(injection_id, path):
-            """Helper function to update the audio file path in database"""
+        def update_database_path(injection_id, path, max_retries=5):
+            """Helper function to update the audio file path in database with retry logic"""
             if not injection_id:
                 return
+            
+            # Also update the file-based status
+            save_status_file(injection_id, "completed", "Audio generation completed", path)
                 
-            try:
-                import sqlite3
-                DB_PATH = "/data/injections_truncate.db"
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                
-                cursor.execute(
-                    "UPDATE injections SET processed_path = ? WHERE id = ?",
-                    (path, injection_id)
-                )
-                conn.commit()
-                conn.close()
-                print(f"✅ Updated audio path in database for ID: {injection_id}")
-            except Exception as e:
-                print(f"⚠️ Error updating database path: {e}")
+            for attempt in range(max_retries):
+                try:
+                    import sqlite3
+                    DB_PATH = "/data/injections_truncate.db"
+                    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                    cursor = conn.cursor()
+                    
+                    # Enable WAL mode
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    
+                    cursor.execute(
+                        "UPDATE injections SET processed_path = ? WHERE id = ?",
+                        (path, injection_id)
+                    )
+                    conn.commit()
+                    conn.close()
+                    print(f"✅ Updated audio path in database for ID: {injection_id}")
+                    return
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < max_retries - 1:
+                        wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1
+                        print(f"⚠️ Database locked during path update, retrying in {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"⚠️ Error updating database path: {e}")
+                except Exception as e:
+                    print(f"⚠️ Error updating database path: {e}")
+                    break
 
         # Update database with final audio path
-        update_database_path(injection_id, final_audio_path)
+        update_database_path(injection_id, audio_file_path)
 
-        # Second explicit commit after database update
-        shared_volume.commit()
+        # Multiple final commits with checks
+        for _ in range(3):
+            shared_volume.commit()
+            time.sleep(0.5)
+            
+            # Verify the file is visible after commit
+            if os.path.exists(audio_file_path):
+                print(f"✅ Audio file confirmed visible after commit: {audio_file_path}")
+                break
+            else:
+                print(f"⚠️ Audio file not visible after commit, retrying: {audio_file_path}")
         
         # Clean up voice state data after successful completion
         if injection_id:
@@ -495,11 +621,18 @@ def generate_audio(encoded_script: str, injection_id: str = None) -> str:
                     voice_states.pop(voice_state_key)
                     print(f"Cleaned up voice state for {voice_state_key}")
 
-        print(f"✅ Done. Final audio saved at: {final_audio_path}")
-        return final_audio_path
+        print(f"✅ Done. Final audio saved at: {audio_file_path}")
+        return audio_file_path
         
     except Exception as e:
         error_message = f"Error during audio generation: {str(e)}"
         print(f"❌ {error_message}")
-        update_status("error", error_message)
+        update_injection_status(injection_id, "error", error_message)
+        
+        # Ensure volume is committed even on error
+        try:
+            shared_volume.commit()
+        except Exception as commit_error:
+            print(f"❌ Error committing volume on failure: {commit_error}")
+            
         raise e
