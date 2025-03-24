@@ -2,9 +2,11 @@ import modal
 import os
 import sqlite3
 import uuid
+import time
+import random
+import json
 from typing import Optional
 import torch
-import json
 import base64
 import asyncio
 from fasthtml.common import *
@@ -181,54 +183,159 @@ class IngestorFactory:
             return None
 
 
-
 # Define directories
 UPLOAD_DIR = "/data/uploads_truncate"
 OUTPUT_DIR = "/data/processed_truncate"
 DB_PATH = "/data/injections_truncate.db"
 AUDIO_DIR = "/data/podcast_audio"  # Standard location for all audio files
+STATUS_DIR = "/data/status"  # New directory for file-based status tracking
 
 # Ensure Directories Exist
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(AUDIO_DIR, exist_ok=True)
+os.makedirs(STATUS_DIR, exist_ok=True)  # Create status directory
 
 # Function to get standardized audio file path
 def get_audio_file_path(injection_id):
     """Returns a standardized path for audio files based on injection_id"""
     return os.path.join(AUDIO_DIR, f"podcast_{injection_id}.wav")
 
-# Function to update injection status
-def update_injection_status(injection_id, status, notes=None):
-    """Update the status and optional notes for an injection"""
+# Function to save status to file as a fallback for database issues
+def save_status_file(injection_id, status, notes=None, file_path=None):
+    """Save status to a file as a fallback when database is unavailable"""
+    if not injection_id:
+        return
+        
+    status_file = os.path.join(STATUS_DIR, f"{injection_id}.json")
+    status_data = {
+        "id": injection_id,
+        "status": status,
+        "notes": notes,
+        "file_path": file_path,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+    }
+    
+    try:
+        with open(status_file, "w") as f:
+            json.dump(status_data, f)
+        print(f"✅ Saved status file for ID: {injection_id}")
+    except Exception as e:
+        print(f"⚠️ Error saving status file: {e}")
+
+# Function to update injection status with retry logic
+def update_injection_status(injection_id, status, notes=None, max_retries=5):
+    """Update the status and optional notes for an injection with retry logic"""
     if not injection_id:
         return
     
+    # Also save to file-based status system as backup
+    audio_path = get_audio_file_path(injection_id)
+    save_status_file(injection_id, status, notes, audio_path)
+    
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10.0)  # Longer timeout
+            cursor = conn.cursor()
+            
+            # Enable WAL mode for better concurrency
+            cursor.execute("PRAGMA journal_mode=WAL;")
+            cursor.execute("PRAGMA synchronous=NORMAL;")
+            
+            # Update status and/or notes
+            if notes:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, processing_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, notes, injection_id)
+                )
+            else:
+                cursor.execute(
+                    "UPDATE injections SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (status, injection_id)
+                )
+                
+            conn.commit()
+            conn.close()
+            print(f"✅ Updated status to '{status}' for ID: {injection_id}")
+            
+            if notes:
+                print(f"📝 Notes: {notes}")
+                
+            return
+            
+        except sqlite3.OperationalError as e:
+            # Handle database lock errors
+            if "database is locked" in str(e) and attempt < max_retries - 1:
+                wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1  # Exponential backoff
+                print(f"⚠️ Database locked, retrying in {wait_time:.2f} seconds (attempt {attempt+1}/{max_retries})...")
+                time.sleep(wait_time)
+            else:
+                print(f"⚠️ Error updating injection status after {attempt+1} attempts: {e}")
+                break
+        except Exception as e:
+            print(f"⚠️ Error updating injection status: {e}")
+            break
+    
+    # If we get here, all retries failed but we still have the file-based status
+
+# Improved function to find audio files with multiple fallbacks
+def find_audio_file(injection_id):
+    """More robust audio file detection with multiple fallbacks"""
+    # Try standard path first
+    standard_path = get_audio_file_path(injection_id)
+    if os.path.exists(standard_path):
+        print(f"Found audio at standard path: {standard_path}")
+        return standard_path
+        
+    # Try checking database
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=5.0)
         cursor = conn.cursor()
         
-        # Update status and/or notes
-        if notes:
-            cursor.execute(
-                "UPDATE injections SET status = ?, processing_notes = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (status, notes, injection_id)
-            )
-        else:
-            cursor.execute(
-                "UPDATE injections SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (status, injection_id)
-            )
-            
-        conn.commit()
-        conn.close()
-        print(f"✅ Updated status to '{status}' for ID: {injection_id}")
+        # Enable WAL mode
+        cursor.execute("PRAGMA journal_mode=WAL;")
         
-        if notes:
-            print(f"📝 Notes: {notes}")
+        cursor.execute(
+            "SELECT processed_path FROM injections WHERE id = ?", 
+            (injection_id,)
+        )
+        result = cursor.fetchone()
+        conn.close()
+        
+        if result and result[0] and os.path.exists(result[0]):
+            print(f"Found audio from database path: {result[0]}")
+            return result[0]
             
     except Exception as e:
-        print(f"⚠️ Error updating injection status: {e}")
+        print(f"Error querying database for audio path: {e}")
+            
+    # Fallback: Search for any file containing the ID
+    try:
+        if os.path.exists(AUDIO_DIR):
+            all_files = os.listdir(AUDIO_DIR)
+            matching_files = [f for f in all_files if injection_id in f]
+            
+            if matching_files:
+                found_path = os.path.join(AUDIO_DIR, matching_files[0])
+                print(f"Found audio by directory search: {found_path}")
+                return found_path
+    except Exception as e:
+        print(f"Error searching directory for audio: {e}")
+            
+    # Check status files as last resort
+    try:
+        status_file = os.path.join(STATUS_DIR, f"{injection_id}.json")
+        if os.path.exists(status_file):
+            with open(status_file, "r") as f:
+                status_data = json.load(f)
+                if "file_path" in status_data and os.path.exists(status_data["file_path"]):
+                    print(f"Found audio from status file: {status_data['file_path']}")
+                    return status_data["file_path"]
+    except Exception as e:
+        print(f"Error checking status file for audio: {e}")
+            
+    print(f"No audio file found for ID: {injection_id}")
+    return None
 
 # Create Modal App
 app = modal.App("content_injection")
@@ -252,11 +359,16 @@ def serve():
         )
     )
     
-    # Setup Database
+    # Setup Database with improved concurrency settings
     def setup_database(db_path: str):
-        """Initialize SQLite database for tracking injections"""
-        conn = sqlite3.connect(db_path)
+        """Initialize SQLite database with better concurrency settings"""
+        conn = sqlite3.connect(db_path, timeout=30.0)  # Increased timeout
         cursor = conn.cursor()
+        
+        # Enable WAL mode for better concurrency
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA synchronous=NORMAL;")
+        
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS injections (
                 id TEXT PRIMARY KEY,
@@ -343,23 +455,47 @@ def serve():
             audio_file_path = get_audio_file_path(injection_id)
 
             # Insert record into database with content size info and initial status
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                """INSERT INTO injections 
-                (id, original_filename, input_type, status, content_length, processing_notes, processed_path) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (injection_id, original_filename, input_type, "pending", 
-                len(processed_text), f"Content ingested: {len(processed_text)} chars", audio_file_path)
-            )
-            conn.commit()
-            conn.close()
+            # Use retry logic to handle potential database locks
+            for attempt in range(5):
+                try:
+                    conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                    cursor = conn.cursor()
+                    
+                    # Enable WAL mode for better concurrency
+                    cursor.execute("PRAGMA journal_mode=WAL;")
+                    cursor.execute("PRAGMA synchronous=NORMAL;")
+                    
+                    cursor.execute(
+                        """INSERT INTO injections 
+                        (id, original_filename, input_type, status, content_length, processing_notes, processed_path) 
+                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (injection_id, original_filename, input_type, "pending", 
+                        len(processed_text), f"Content ingested: {len(processed_text)} chars", audio_file_path)
+                    )
+                    conn.commit()
+                    conn.close()
+                    break
+                except sqlite3.OperationalError as e:
+                    if "database is locked" in str(e) and attempt < 4:
+                        wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1
+                        print(f"⚠️ Database locked during insert, retrying in {wait_time:.2f} seconds...")
+                        time.sleep(wait_time)
+                    else:
+                        print(f"⚠️ Error inserting record: {e}")
+                        raise
+                except Exception as e:
+                    print(f"⚠️ Error inserting record: {e}")
+                    raise
+
+            # Also save to file-based status system
+            save_status_file(injection_id, "pending", f"Content ingested: {len(processed_text)} chars", audio_file_path)
 
             # Update status to show script generation starting
             update_injection_status(injection_id, "processing", "Starting script generation...")
 
             # Proper function sequence with correctly coupled inputs/outputs
             print("🚀 Kicking off script generation...")
+            
             # First run script generation and get the result
             script_data = generate_script.remote(processed_text)
             
@@ -548,59 +684,96 @@ def serve():
     #################################################
     @rt("/podcast-status-api/{injection_id}")
     def podcast_status_api(injection_id: str):
-        """API endpoint that returns just the status data in JSON format"""
-        # Reload volume to get latest
-        shared_volume.reload()
+        """API endpoint with improved reliability for checking podcast status"""
+        # Always reload volume first
+        for _ in range(3):  # Try up to 3 reloads
+            shared_volume.reload()
+            
+            # First check if audio file exists directly (fastest path)
+            audio_path = find_audio_file(injection_id)
+            if audio_path:
+                # Audio exists, return completed status
+                return JSONResponse({
+                    "status": "completed",
+                    "notes": "Audio file found",
+                    "is_completed": True,
+                    "audio_exists": True,
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                })
+            
+            time.sleep(0.1)  # Brief pause between reloads
         
-        # Check database for current status
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT status, processed_path, processing_notes, created_at FROM injections WHERE id = ?", 
-            (injection_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            return JSONResponse({"status": "error", "message": "Podcast not found"})
-        
-        status, audio_path, notes, created_at = result
-        is_completed = status == "completed"
-        
-        # Check if audio file exists at standard location
-        audio_exists = False
-        if is_completed:
-            standard_path = get_audio_file_path(injection_id)
-            audio_exists = os.path.exists(standard_path) or (audio_path and os.path.exists(audio_path))
-        
-            # If we can't find the audio file but status is completed, check the audio dir for matching files
-            if not audio_exists and os.path.exists(AUDIO_DIR):
-                all_files = os.listdir(AUDIO_DIR)
-                matching_files = [f for f in all_files if injection_id in f]
+        # Then check file-based status (second fastest)
+        status_file = os.path.join(STATUS_DIR, f"{injection_id}.json")
+        if os.path.exists(status_file):
+            try:
+                with open(status_file, "r") as f:
+                    status_data = json.load(f)
+                    return JSONResponse({
+                        "status": status_data.get("status", "processing"),
+                        "notes": status_data.get("notes"),
+                        "is_completed": status_data.get("status") == "completed",
+                        "audio_exists": os.path.exists(status_data.get("file_path", "")),
+                        "timestamp": status_data.get("updated_at")
+                    })
+            except Exception as e:
+                print(f"Error reading status file: {e}")
+    
+        # Finally check database as last resort (with retries for locks)
+        for attempt in range(3):
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=5.0)
+                cursor = conn.cursor()
                 
-                if matching_files:
-                    audio_exists = True
-                    # Update the database with the found file path
-                    found_path = os.path.join(AUDIO_DIR, matching_files[0])
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE injections SET processed_path = ? WHERE id = ?",
-                            (found_path, injection_id)
-                        )
-                        conn.commit()
-                        conn.close()
-                    except Exception as e:
-                        print(f"Error updating database with found path: {e}")
-        
+                # Enable WAL mode for better concurrency
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                
+                cursor.execute(
+                    "SELECT status, processed_path, processing_notes, created_at FROM injections WHERE id = ?", 
+                    (injection_id,)
+                )
+                result = cursor.fetchone()
+                conn.close()
+                
+                if result:
+                    status, path, notes, created_at = result
+                    is_completed = status == "completed"
+                    audio_exists = False
+                    
+                    # Double check if audio exists
+                    if is_completed:
+                        audio_exists = path and os.path.exists(path)
+                        
+                        # If status is completed but can't find audio, do a final search
+                        if not audio_exists:
+                            audio_path = find_audio_file(injection_id)
+                            audio_exists = audio_path is not None
+                    
+                    return JSONResponse({
+                        "status": status,
+                        "notes": notes,
+                        "is_completed": is_completed,
+                        "audio_exists": audio_exists,
+                        "timestamp": created_at
+                    })
+                break
+                
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e) and attempt < 2:
+                    wait_time = 0.1 * (2 ** attempt) + random.random() * 0.1
+                    print(f"⚠️ Database locked during status check, retrying in {wait_time:.2f} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"⚠️ Error checking status in database: {e}")
+            except Exception as e:
+                print(f"⚠️ Error checking status in database: {e}")
+                break
+    
         return JSONResponse({
-            "status": status,
-            "notes": notes,
-            "is_completed": is_completed,
-            "audio_exists": audio_exists,
-            "timestamp": created_at
+            "status": "unknown", 
+            "message": "Podcast not found or database unavailable",
+            "is_completed": False,
+            "audio_exists": False
         })
 
     #################################################
@@ -609,69 +782,86 @@ def serve():
     @rt("/podcast-status/{injection_id}")
     def podcast_status(injection_id: str):
         """Status page that polls efficiently and reloads once when ready"""
-        # First explicitly reload the volume to get latest changes
-        shared_volume.reload()
+        # First explicitly reload the volume multiple times to get latest changes
+        for _ in range(3):
+            shared_volume.reload()
+            time.sleep(0.1)
         
-        # Initial database query for the first render
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT status, processed_path, processing_notes, created_at FROM injections WHERE id = ?", 
-            (injection_id,)
-        )
-        result = cursor.fetchone()
-        conn.close()
+        # Try the file-based status system first (faster)
+        status_file = os.path.join(STATUS_DIR, f"{injection_id}.json")
+        if os.path.exists(status_file):
+            try:
+                with open(status_file, "r") as f:
+                    status_data = json.load(f)
+                    status = status_data.get("status", "processing")
+                    notes = status_data.get("notes", "Processing...")
+                    created_at = status_data.get("updated_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+                    audio_path = status_data.get("file_path")
+                    print(f"Found podcast status in file system: {status}")
+            except Exception as e:
+                print(f"Error reading status file: {e}")
+                # Continue to database check if status file read fails
+                status_data = None
+        else:
+            status_data = None
         
-        if not result:
-            return Title("Podcast Not Found"), Main(
-                Div(
-                    H1("Podcast Not Found", cls="text-2xl font-bold text-center text-error mb-4"),
-                    P(f"No podcast with ID: {injection_id} was found", cls="text-center mb-4"),
-                    A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
-                    cls="container mx-auto px-4 py-8 max-w-3xl"
+        # If no status file, check the database
+        if not status_data:
+            try:
+                conn = sqlite3.connect(DB_PATH, timeout=10.0)
+                cursor = conn.cursor()
+                
+                # Enable WAL mode for better concurrency
+                cursor.execute("PRAGMA journal_mode=WAL;")
+                
+                cursor.execute(
+                    "SELECT status, processed_path, processing_notes, created_at FROM injections WHERE id = ?", 
+                    (injection_id,)
                 )
-            )
+                result = cursor.fetchone()
+                conn.close()
+                
+                if not result:
+                    return Title("Podcast Not Found"), Main(
+                        Div(
+                            H1("Podcast Not Found", cls="text-2xl font-bold text-center text-error mb-4"),
+                            P(f"No podcast with ID: {injection_id} was found", cls="text-center mb-4"),
+                            A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
+                            cls="container mx-auto px-4 py-8 max-w-3xl"
+                        )
+                    )
+                
+                status, audio_path, notes, created_at = result
+            except Exception as e:
+                print(f"Error querying database: {e}")
+                # If both status file and database fail, show not found
+                return Title("Podcast Not Found"), Main(
+                    Div(
+                        H1("Database Error", cls="text-2xl font-bold text-center text-error mb-4"),
+                        P(f"Could not retrieve podcast with ID: {injection_id}", cls="text-center mb-4"),
+                        P(f"Error: {str(e)}", cls="text-center mb-2 text-error"),
+                        A("← Back to Home", href="/", cls="btn btn-primary block mx-auto"),
+                        cls="container mx-auto px-4 py-8 max-w-3xl"
+                    )
+                )
         
-        status, audio_path, notes, created_at = result
         is_completed = status == "completed"
         
-        # Check if audio file exists at standard location
+        # Check for the audio file with improved logic
         audio_exists = False
         file_path = None
         
         if is_completed:
-            # Try the path from database first
-            if audio_path and os.path.exists(audio_path):
-                audio_exists = True
-                file_path = audio_path
+            # Use our comprehensive find_audio_file function
+            file_path = find_audio_file(injection_id)
+            audio_exists = file_path is not None
             
-            # Then try standard path
-            standard_path = get_audio_file_path(injection_id)
-            if os.path.exists(standard_path):
-                audio_exists = True
-                file_path = standard_path
-                
-            # If still no file found, search directory
-            if not audio_exists and os.path.exists(AUDIO_DIR):
-                all_files = os.listdir(AUDIO_DIR)
-                matching_files = [f for f in all_files if injection_id in f]
-                
-                if matching_files:
-                    audio_exists = True
-                    file_path = os.path.join(AUDIO_DIR, matching_files[0])
-                    
-                    # Update database if found
-                    try:
-                        conn = sqlite3.connect(DB_PATH)
-                        cursor = conn.cursor()
-                        cursor.execute(
-                            "UPDATE injections SET processed_path = ? WHERE id = ?",
-                            (file_path, injection_id)
-                        )
-                        conn.commit()
-                        conn.close()
-                    except Exception as e:
-                        print(f"Error updating database with found path: {e}")
+            # If file found, update both status systems with the correct path
+            if audio_exists:
+                try:
+                    update_injection_status(injection_id, "completed", f"Audio file found at {file_path}", max_retries=2)
+                except Exception as e:
+                    print(f"Error updating database with found path: {e}")
             
         # If we're receiving a request and status is already completed with audio,
         # assume this is the post-reload page view where we want to show the player
@@ -732,11 +922,14 @@ def serve():
         if elapsed_seconds > 300:  # After 5 minutes
             poll_interval = 15000  # 15 seconds
         
-        # Only include this script if not already completed with available audio
+        # Enhanced polling script with better error handling and audio detection
+        # Enhanced polling script with better error handling and audio detection
         status_polling_script = Script(f"""
         // Global variable to hold the timeout ID
         let pollTimeoutId = null;
-        
+        let failedPollCount = 0;  // Added this declaration
+        const MAX_FAILED_POLLS = 10;
+                
         // Function to check status
         function checkStatus() {{
             console.log("Checking podcast status...");
@@ -745,10 +938,14 @@ def serve():
                 .then(response => response.json())
                 .then(data => {{
                     console.log('Status update:', data);
+                    failedPollCount = 0; // Reset failed poll counter
                     
                     // Update status display
-                    document.getElementById('status-text').innerText = 'Status: ' + data.status;
-                    document.getElementById('status-notes').innerText = data.notes || 'Processing...';
+                    const statusText = document.getElementById('status-text');
+                    if (statusText) statusText.innerText = 'Status: ' + data.status;
+                    
+                    const statusNotes = document.getElementById('status-notes');
+                    if (statusNotes) statusNotes.innerText = data.notes || 'Processing...';
                     
                     // Calculate progress percentage
                     let createdAt = data.timestamp;
@@ -785,7 +982,7 @@ def serve():
                         const statusIcon = document.getElementById('status-icon');
                         if (statusIcon) statusIcon.innerHTML = '<span class="text-4xl">✓</span>';
                         
-                        document.getElementById('status-notes').innerText = 'Podcast is ready! Loading player...';
+                        if (statusNotes) statusNotes.innerText = 'Podcast is ready! Loading player...';
                         
                         // Very important: Clear the timeout to stop polling
                         if (pollTimeoutId) {{
@@ -797,6 +994,19 @@ def serve():
                         // Brief delay then reload
                         setTimeout(() => window.location.reload(), 1000);
                         return; // Exit function immediately
+                    }}
+                    
+                    // Handle audio-ready-but-not-marked-complete edge case
+                    if (data.audio_exists && !data.is_completed) {{
+                        console.log('Audio exists but status not marked complete. Reloading to check...');
+                        // Clear timeout
+                        if (pollTimeoutId) {{
+                            clearTimeout(pollTimeoutId);
+                            pollTimeoutId = null;
+                        }}
+                        // Brief delay then reload
+                        setTimeout(() => window.location.reload(), 1000);
+                        return;
                     }}
                     
                     // IMPORTANT: Only continue polling if not completed
@@ -811,11 +1021,25 @@ def serve():
                 }})
                 .catch(error => {{
                     console.error('Error checking status:', error);
+                    failedPollCount++;  // Make sure this is after variable is declared
+                    console.log(`Poll attempt failed (${{failedPollCount}}/${{MAX_FAILED_POLLS}})`);
+                    
+                    // If too many failures, show error message
+                    if (failedPollCount >= MAX_FAILED_POLLS) {{
+                        const statusNotes = document.getElementById('status-notes');
+                        if (statusNotes) statusNotes.innerText = 'Connection issues. Please refresh the page.';
+                        if (pollTimeoutId) {{
+                            clearTimeout(pollTimeoutId);
+                            pollTimeoutId = null;
+                        }}
+                        return;
+                    }}
+                    
                     // Continue polling even on error, with longer interval
                     pollTimeoutId = setTimeout(checkStatus, {poll_interval * 2});
                 }});
         }}
-        
+                
         // Start polling (only if we're not already on a page with a completed podcast)
         if (!document.getElementById('completed-indicator')) {{
             console.log('Starting status polling...');
@@ -907,75 +1131,37 @@ def serve():
     #################################################
     @rt("/audio-raw/{injection_id}")
     def serve_audio_raw(injection_id: str):
-        """Direct audio file handler with standardized path and volume reload"""
+        """Direct audio file handler with extensive fallbacks and retries"""
         print(f"📢 Audio request received for ID: {injection_id}")
         
-        # First explicitly reload the volume to get latest changes
-        shared_volume.reload()
-        
-        # Try standardized path first
-        audio_path = get_audio_file_path(injection_id)
-        
-        # If standardized path doesn't exist, check database
-        if not os.path.exists(audio_path):
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT processed_path FROM injections WHERE id = ?", 
-                (injection_id,)
-            )
-            result = cursor.fetchone()
-            conn.close()
+        # Multiple explicit reload attempts
+        for reload_attempt in range(3):
+            shared_volume.reload()
             
-            if result and result[0]:
-                audio_path = result[0]
-        
-        # If the file exists, serve it
-        if os.path.exists(audio_path):
-            print(f"✅ Serving audio file: {audio_path}")
-            return FileResponse(
-                audio_path, 
-                media_type="audio/wav",
-                filename=f"podcast_{injection_id}.wav"
-            )
-                
-        # If not found, try to find any file with this ID in the audio directory
-        if os.path.exists(AUDIO_DIR):
-            all_files = os.listdir(AUDIO_DIR)
-            matching_files = [f for f in all_files if injection_id in f]
+            # Use the comprehensive find_audio_file function
+            audio_path = find_audio_file(injection_id)
             
-            print(f"🔍 Looking for files matching {injection_id}")
-            print(f"📂 All files in {AUDIO_DIR}: {len(all_files)} files")
-            print(f"🔍 Files matching {injection_id}: {matching_files}")
-            
-            # If we find a matching file, use it
-            if matching_files:
-                alt_path = os.path.join(AUDIO_DIR, matching_files[0])
-                print(f"🔄 Using alternate file path: {alt_path}")
-                
-                # Update the database with the correct path
-                conn = sqlite3.connect(DB_PATH)
-                cursor = conn.cursor()
-                cursor.execute(
-                    "UPDATE injections SET processed_path = ? WHERE id = ?",
-                    (alt_path, injection_id)
-                )
-                conn.commit()
-                conn.close()
-                
+            # If we found a file, serve it right away
+            if audio_path and os.path.exists(audio_path):
+                print(f"✅ Serving audio file: {audio_path}")
                 return FileResponse(
-                    alt_path, 
+                    audio_path, 
                     media_type="audio/wav",
                     filename=f"podcast_{injection_id}.wav"
                 )
+            
+            # Brief pause before next attempt
+            time.sleep(0.5)
         
-        # If no file found, return error
+        # If all reload attempts failed, return error
         return HTMLResponse(
             """
-            <div style="padding: 20px; background-color: #fff3cd; color: #856404; border-radius: 5px; margin: 20px auto; max-width: 600px; text-align: center;">
+            <div style="padding: 20px; background-color: #fff3cd; color: #856404; 
+                 border-radius: 5px; margin: 20px auto; max-width: 600px; text-align: center;">
                 <h3>Audio file not yet available</h3>
                 <p>The podcast may still be processing. Please check back in a few minutes.</p>
-                <p>If the issue persists, you can try refreshing the main status page.</p>
+                <p>If the issue persists, try refreshing the main status page.</p>
+                <p><a href="/" style="color: #0056b3; text-decoration: underline;">Return to Homepage</a></p>
             </div>
             """,
             status_code=404
