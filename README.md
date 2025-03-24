@@ -265,6 +265,7 @@ This standardization addresses a subtle but critical issue: Bark produces extend
    - Currently podcasters take a first-person perspective (i.e., speakers embody the CV subject).
    - Better to retain podcasters in the third-person perspective (speakers analyze the CV as external content), similar to Google NotebookLLM.
    - This shift from "persona adoption" to "content discussion" would create a more natural podcast format.
+   - Also podcaster's drag out their goodbyes, they might need some encouragmenet to end the show a little more concisley via prompt! 
 - Support additional [input formats](https://github.com/meta-llama/llama-recipes/pull/750) (i.e. YouTube URLs, requires Modal Labs 'Team 'subscription in order to avail of IP Proxy)
 - Take advantage of Barks [MUSIC], implement music at the start or end of a podcast using Bark's `♪ ` surronding lyrics gnerated by an LLM (based on podcast topic).
    - The TTS sometimes does hallucinate/generate music at the end of a podcast by itself.
